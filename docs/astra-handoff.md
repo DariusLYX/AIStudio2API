@@ -37,12 +37,12 @@
 # 强制使用 Camoufox 浏览器后端
 WAA_BACKEND=camoufox
 
-# 双号常驻预热：2 个号保持常驻，单号并发严格限制为 1（模拟真人单窗口顺序操作）
+# 双号常驻预热：2 个号保持常驻，单号允许 2 并发（多并发或多会话交替时自动在同浏览器开新 Tab 并保持各 Tab 历史）
 WARM_WORKER_LIMIT=2
 MAX_ACTIVE_WORKERS=2
-PER_ACCOUNT_CONCURRENCY=1
+PER_ACCOUNT_CONCURRENCY=2
 
-# 账号粘性优先（配合 PageChatAccount 实现多轮对话锁号，仅当 1 号冷却或忙碌时切 2 号）
+# 账号粘性优先（配合 PageChatAccount + acquireChat 多标签页亲和匹配，多对话同时交替聊也不会互相冲掉）
 ROUTING_STRATEGY=fill-first
 
 # 关闭首字超时并发备用请求（避免一个问题同时在两个号上点 Run）
