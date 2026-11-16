@@ -1925,6 +1925,9 @@ func (service *trackedService) generateWithRetry(
 		preferredAccountID = service.service.(aistudio.AssistantService).AssistantAccount(requestCtx, request)
 	} else {
 		preferredAccountID = service.pool.InlineMediaAccount(request.Contents)
+		if preferredAccountID == "" {
+			preferredAccountID = aistudio.PageChatAccount(request.Contents)
+		}
 	}
 	hedgeable := !request.Background && !assistant && !service.pool.InteractionAgentModel(modelID) && (service.hedgeAuto || service.hedgeAfter > 0) && slices.Contains(service.hedgeModels, modelID)
 	hedged := false

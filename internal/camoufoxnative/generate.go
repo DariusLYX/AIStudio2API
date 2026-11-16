@@ -26,10 +26,14 @@ type GenerateTurn struct {
 type chatTab struct {
 	contextID string
 	page      pageHandle
+	// model 是当前标签页打开的官网模型 ID（不含 models/ 前缀）
+	model string
 	// busy 表示标签页正在运行一轮对话
 	busy bool
 	// contents 是标签页上一轮发出的 GenerateContent 的 contents，页面没有对话或上一轮以上游错误结束时为空
 	contents []json.RawMessage
+	// dirty 表示上一轮请求在点击 Run 后失败或返回非 200，页面残留未同步的对话轮次，下一轮需先点 New chat 清空
+	dirty bool
 	// resetting 在一轮对话结束后于后台新开对话期间非空，新开结束时关闭
 	resetting chan struct{}
 	// runHovered 表示后台新开对话后指针停在 Run 按钮上
@@ -100,6 +104,15 @@ func GeneratePrompt(body []byte) (string, bool) {
 	return text, text != ""
 }
 
+// wireSystemText 返回 GenerateContent 正文第 5 槽（SystemInstruction）的文本，供新对话首轮合并入输入框提示词
+func wireSystemText(body []byte) string {
+	var fields []json.RawMessage
+	if json.Unmarshal(body, &fields) != nil || len(fields) <= 5 || bytes.Equal(bytes.TrimSpace(fields[5]), []byte("null")) {
+		return ""
+	}
+	return strings.TrimSpace(contentText(fields[5]))
+}
+
 // lastUserParts 返回 GenerateContent 正文最后一个轮次是 user 轮次时它的各 Part，否则为 nil
 func lastUserParts(body []byte) [][]json.RawMessage {
 	contents, err := generateContents(body)
@@ -140,6 +153,77 @@ func GenerateFiles(body []byte) []string {
 	return files
 }
 
+// visibleContentText 返回 wire 轮次中非思考 Part（part[11] != 1）的可见文本（按空串拼接以兼容流式分块还原的模型轮）
+func visibleContentText(content json.RawMessage) string {
+	var fields []json.RawMessage
+	var parts [][]json.RawMessage
+	if json.Unmarshal(content, &fields) != nil || len(fields) == 0 || json.Unmarshal(fields[0], &parts) != nil {
+		return ""
+	}
+	values := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if len(part) > 11 && bytes.Equal(bytes.TrimSpace(part[11]), []byte("1")) {
+			continue
+		}
+		var text string
+		if len(part) > 1 && json.Unmarshal(part[1], &text) == nil && text != "" {
+			values = append(values, text)
+		}
+	}
+	return strings.TrimSpace(strings.Join(values, ""))
+}
+
+// nonTextPartDigest 返回 wire 轮次中除思考 Part、思考签名与纯文本之外的其余 Part（如图片、文件、函数调用与函数结果）的规范化列表
+func nonTextTurnParts(content json.RawMessage) string {
+	var fields []json.RawMessage
+	var parts [][]json.RawMessage
+	if json.Unmarshal(content, &fields) != nil || len(fields) == 0 || json.Unmarshal(fields[0], &parts) != nil {
+		return ""
+	}
+	var kept [][]json.RawMessage
+	for _, part := range parts {
+		if len(part) > 11 && bytes.Equal(bytes.TrimSpace(part[11]), []byte("1")) {
+			continue
+		}
+		cleaned := make([]json.RawMessage, len(part))
+		copy(cleaned, part)
+		if len(cleaned) > 1 {
+			cleaned[1] = json.RawMessage("null")
+		}
+		if len(cleaned) > 10 {
+			cleaned[10] = json.RawMessage("null")
+		}
+		for len(cleaned) > 0 && bytes.Equal(bytes.TrimSpace(cleaned[len(cleaned)-1]), []byte("null")) {
+			cleaned = cleaned[:len(cleaned)-1]
+		}
+		if len(cleaned) > 0 {
+			kept = append(kept, cleaned)
+		}
+	}
+	if len(kept) == 0 {
+		return ""
+	}
+	encoded, _ := json.Marshal(kept)
+	return string(encoded)
+}
+
+// sameTurnContent 判断两个对话轮次是否表示同一轮对话（原始字节相同，或角色、非思考可见正文与非文本附件/函数调用均相同）
+func sameTurnContent(left, right json.RawMessage) bool {
+	if bytes.Equal(left, right) {
+		return true
+	}
+	roleL, roleR := contentRole(left), contentRole(right)
+	if roleL == "" || roleL != roleR {
+		return false
+	}
+	textL, textR := visibleContentText(left), visibleContentText(right)
+	nonTextL, nonTextR := nonTextTurnParts(left), nonTextTurnParts(right)
+	if textL == "" && nonTextL == "" {
+		return false
+	}
+	return textL == textR && nonTextL == nonTextR
+}
+
 // nextChatAction 按标签页上一轮的 contents 判断本轮的操作：contents 相同时 Rerun，在上一轮后追加 model 与 user 两轮时继续当前对话，上一轮 contents 为空时在当前对话后直接输入，其余情况先开新对话
 func nextChatAction(previous, contents []json.RawMessage) chatAction {
 	if previous == nil {
@@ -150,7 +234,7 @@ func nextChatAction(previous, contents []json.RawMessage) chatAction {
 			return false
 		}
 		for index := range left {
-			if !bytes.Equal(left[index], right[index]) {
+			if !sameTurnContent(left[index], right[index]) {
 				return false
 			}
 		}
@@ -163,6 +247,25 @@ func nextChatAction(previous, contents []json.RawMessage) chatAction {
 		return chatContinue
 	}
 	return chatNew
+}
+
+// ContinuesChat 判断当前 Worker 是否有空闲标签页正在进行该对话的上一轮，供多账户调度器优先复用同一账户保持多轮连续对话
+func (worker *Worker) ContinuesChat(body []byte) bool {
+	contents, err := generateContents(body)
+	if err != nil || len(contents) == 0 {
+		return false
+	}
+	worker.mu.Lock()
+	defer worker.mu.Unlock()
+	for _, tab := range worker.chats {
+		if !tab.busy && !tab.dirty && len(tab.contents) > 0 {
+			action := nextChatAction(tab.contents, contents)
+			if action == chatContinue || action == chatRerun {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // generateArmFunction 是在页面上为下一次 Run 安装一次性钩子的函数声明：官网高层 proof 函数下一次被调用时记下请求已开始并以本请求的 digest 取 proof，proof 返回后下一个 GenerateContent XHR 发送时把正文换成 head + proof + tail，并在该 XHR 上监听响应，经通道先发出带 proof 的 {sent: true, proof}，再依次发出响应头、正文块与结束标记；参数依次为页面对象、请求 ID、digest、head、tail 与通道
@@ -237,7 +340,7 @@ func (worker *Worker) Generate(ctx context.Context, turn GenerateTurn) (*Protect
 		if tab, err = worker.acquireFunctionChat(contents); err != nil {
 			return nil, err
 		}
-	} else if tab, err = worker.acquireChat(ctx); err != nil {
+	} else if tab, err = worker.acquireChat(ctx, contents); err != nil {
 		return nil, err
 	}
 	response, err := worker.generate(ctx, tab, turn, contents, prompt)
@@ -267,19 +370,28 @@ func (worker *Worker) generate(ctx context.Context, tab *chatTab, turn GenerateT
 	proof, err := worker.waitSent(ctx, tab, requestID, channel)
 	unboost()
 	if err != nil {
+		worker.mu.Lock()
+		tab.dirty = true
+		worker.mu.Unlock()
 		return nil, worker.abandonProtectedRequest(ctx, tab.contextID, tab.page, requestID, fmt.Errorf("等待页面应用发出 GenerateContent: %w", err))
 	}
 	worker.mu.Lock()
 	tab.contents = contents
+	tab.dirty = false
 	tab.unsent = false
 	worker.mu.Unlock()
 	status, header, err := readResponseHead(ctx, channel)
 	if err != nil {
+		worker.mu.Lock()
+		tab.dirty = true
+		tab.contents = nil
+		worker.mu.Unlock()
 		client.closeChannel(requestID)
 		return nil, errors.Join(err, worker.stopTurn(tab))
 	}
 	if status != http.StatusOK {
 		worker.mu.Lock()
+		tab.dirty = true
 		tab.contents = nil
 		worker.mu.Unlock()
 	}
@@ -290,7 +402,7 @@ func (worker *Worker) generate(ctx context.Context, tab *chatTab, turn GenerateT
 		Proof:      proof,
 		Body: &protectedResponseBody{
 			ctx: bodyCtx, cancel: cancelBody, worker: worker, contextID: tab.contextID, page: tab.page, requestID: requestID, channel: channel,
-			stop: func() error { return worker.stopTurn(tab) }, release: func(done, call bool) { worker.releaseChat(tab, done && status == http.StatusOK && !call) },
+			stop: func() error { return worker.stopTurn(tab) }, release: func(done, call bool) { worker.releaseChat(tab, false) },
 		},
 	}, nil
 }
@@ -312,21 +424,29 @@ func (worker *Worker) startTurn(ctx context.Context, tab *chatTab, turn Generate
 		return err
 	}
 	worker.mu.Lock()
+	previousEmpty := len(tab.contents) == 0
+	dirty := tab.dirty
 	action := nextChatAction(tab.contents, contents)
 	hovered := tab.runHovered
 	tab.runHovered = false
-	if tab.unsent && action == chatRerun {
+	if (tab.unsent && action == chatRerun) || dirty {
 		action = chatNew
 	}
 	worker.mu.Unlock()
 	if turn.Result != "" {
 		return worker.submitResult(ctx, input, tab, turn, requestID)
 	}
+	if previousEmpty && action != chatNew {
+		if empty, err := client.evaluateBool(input, tab.contextID, chatEmptyExpression); err == nil && !empty {
+			action = chatNew
+		}
+	}
 	if action == chatNew {
 		hovered = false
 		if err := worker.newChat(input, tab); err != nil {
 			return err
 		}
+		previousEmpty = true
 		if err := ctx.Err(); err != nil {
 			return err
 		}
@@ -347,11 +467,17 @@ func (worker *Worker) startTurn(ctx context.Context, tab *chatTab, turn Generate
 		tab.unsent = true
 		worker.mu.Unlock()
 		if unsent {
-			if err := pressKeys(input, client, tab.contextID, selectAllKeyActions); err != nil {
+			if err := pressKeys(input, client, tab.contextID, shortcutKeyActions("a")); err != nil {
 				return fmt.Errorf("全选官网输入框中未发出的输入: %w", err)
 			}
 		}
-		if err := pastePrompt(input, client, tab.contextID, promptHead(prompt)); err != nil {
+		inputPrompt := prompt
+		if previousEmpty {
+			if sys := wireSystemText(turn.Body); sys != "" {
+				inputPrompt = sys + "\n\n" + inputPrompt
+			}
+		}
+		if err := pastePrompt(input, client, tab.contextID, promptHead(inputPrompt)); err != nil {
 			return err
 		}
 		if err := worker.waitRunnable(ctx, tab); err != nil {
@@ -498,6 +624,7 @@ func (worker *Worker) newChat(ctx context.Context, tab *chatTab) error {
 	}
 	worker.mu.Lock()
 	tab.contents = nil
+	tab.dirty = false
 	tab.unsent = false
 	worker.mu.Unlock()
 	return nil
@@ -536,25 +663,48 @@ func (worker *Worker) click(ctx context.Context, contextID, selector, pattern, n
 	return nil
 }
 
-// acquireChat 取得一个空闲的界面对话标签页并标为忙碌；没有空闲标签页时等待在后台新开对话的标签页，全部标签页都在运行对话时新建标签页、选中后在其中载入官网页面，载入期间其他标签页照常接收输入
-func (worker *Worker) acquireChat(ctx context.Context) (*chatTab, error) {
+// acquireChat 取得一个空闲的界面对话标签页并标为忙碌（优先选择可续接当前对话的标签页，其次选择空白标签页）；没有空闲标签页时等待在后台新开对话的标签页，全部标签页都在运行对话时新建标签页、选中后在其中载入官网页面，载入期间其他标签页照常接收输入
+func (worker *Worker) acquireChat(ctx context.Context, contents []json.RawMessage) (*chatTab, error) {
 	for {
 		worker.mu.Lock()
 		if worker.closed {
 			worker.mu.Unlock()
 			return nil, errors.New("Camoufox runtime 已关闭")
 		}
+		var matched, empty, fallback *chatTab
 		var resetting chan struct{}
 		for _, tab := range worker.chats {
 			if !tab.busy {
-				tab.busy = true
-				worker.useTab(tab.contextID)
-				worker.mu.Unlock()
-				return tab, nil
+				if !tab.dirty && len(tab.contents) > 0 {
+					action := nextChatAction(tab.contents, contents)
+					if (action == chatContinue || action == chatRerun) && matched == nil {
+						matched = tab
+					}
+				}
+				if !tab.dirty && len(tab.contents) == 0 && empty == nil {
+					empty = tab
+				}
+				if fallback == nil {
+					fallback = tab
+				}
+				continue
 			}
 			if tab.resetting != nil {
 				resetting = tab.resetting
 			}
+		}
+		chosen := matched
+		if chosen == nil {
+			chosen = empty
+		}
+		if chosen == nil {
+			chosen = fallback
+		}
+		if chosen != nil {
+			chosen.busy = true
+			worker.useTab(chosen.contextID)
+			worker.mu.Unlock()
+			return chosen, nil
 		}
 		if resetting == nil {
 			break
@@ -593,7 +743,8 @@ func (worker *Worker) acquireChat(ctx context.Context) (*chatTab, error) {
 	if err != nil {
 		return nil, errors.Join(err, worker.closeTab(contextID))
 	}
-	tab := &chatTab{contextID: contextID, page: loaded.page, busy: true}
+	model := strings.TrimPrefix(strings.TrimSpace(options.Model), "models/")
+	tab := &chatTab{contextID: contextID, page: loaded.page, model: model, busy: true}
 	worker.mu.Lock()
 	defer worker.mu.Unlock()
 	if worker.closed {

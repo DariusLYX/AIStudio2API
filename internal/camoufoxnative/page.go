@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math/rand/v2"
 	"strings"
 )
 
@@ -58,6 +59,21 @@ const proofFunction = `async (page, prompt, digest) => {
 // clipboardWriteFunction 把参数文本写入剪贴板，调用时带用户激活
 const clipboardWriteFunction = `text => navigator.clipboard.writeText(text)`
 
+// shortcutKeyActions 生成带随机按键停顿的 Ctrl+<key> 可信键盘动作
+func shortcutKeyActions(key string) []map[string]any {
+	control := pasteKeyActions[0]["value"]
+	d1 := 18 + rand.IntN(25)
+	d2 := 20 + rand.IntN(25)
+	d3 := 55 + rand.IntN(45)
+	d4 := 18 + rand.IntN(25)
+	return []map[string]any{
+		{"type": "keyDown", "value": control}, {"type": "pause", "duration": d1},
+		{"type": "keyDown", "value": key}, {"type": "pause", "duration": d2}, {"type": "pause", "duration": d3},
+		{"type": "keyUp", "value": key}, {"type": "pause", "duration": d4},
+		{"type": "keyUp", "value": control},
+	}
+}
+
 // pasteKeyActions 是在官网输入框按 Ctrl+V 的可信键盘动作：按下 Control 与 V，按住 70 ms 后依次抬起
 var pasteKeyActions = []map[string]any{
 	{"type": "keyDown", "value": "\uE009"}, {"type": "pause", "duration": 25},
@@ -78,7 +94,7 @@ func pasteText(ctx context.Context, client *bidiClient, contextID, text string) 
 	if _, err := client.invoke(ctx, contextID, clipboardWriteFunction, []any{text}, map[string]any{"userActivation": true}); err != nil {
 		return fmt.Errorf("写入剪贴板: %w", err)
 	}
-	return pressKeys(ctx, client, contextID, pasteKeyActions)
+	return pressKeys(ctx, client, contextID, shortcutKeyActions("v"))
 }
 
 // pressKeys 以可信键盘依次执行 actions
@@ -219,20 +235,22 @@ const (
 	rerunButtonSelector = `ms-chat-turn:last-of-type button[aria-label^="Rerun" i]`
 )
 
-// pointerTargetFunction 把 selector 匹配且文字或 aria-label 匹配 pattern 的第一个可见元素滚动到视口内，返回其中心坐标 JSON，没有时返回空字符串
+// pointerTargetFunction 把 selector 匹配且文字或 aria-label 匹配 pattern 的第一个可见元素滚动到视口内，返回其内部安全区随机坐标 JSON，没有时返回空字符串
 const pointerTargetFunction = `(selector, pattern) => {
   const expression = new RegExp(pattern, 'i');
   const item = [...document.querySelectorAll(selector)].find(node => node.checkVisibility({visibilityProperty: true}) && expression.test((node.innerText || node.getAttribute('aria-label') || '').trim()));
   if (!item) return '';
   item.scrollIntoView({block: 'nearest', inline: 'nearest'});
   const box = item.getBoundingClientRect();
-  return JSON.stringify({x: Math.round(box.left + box.width / 2), y: Math.round(box.top + box.height / 2)});
+  const rx = 0.3 + Math.random() * 0.4;
+  const ry = 0.3 + Math.random() * 0.4;
+  return JSON.stringify({x: Math.round(box.left + box.width * rx), y: Math.round(box.top + box.height * ry)});
 }`
 
-// pointerMoveDuration 是可信指针从别处移到目标元素所用的毫秒数
+// pointerMoveDuration 是可信指针从别处移到目标元素所用的基准毫秒数
 const pointerMoveDuration = 120
 
-// pointer 以可信指针用 move 毫秒移到 selector 与 pattern 匹配的可见元素中心，click 为真时再按下、停顿并抬起，返回是否找到该元素
+// pointer 以可信指针带随机时长移到 selector 与 pattern 匹配的可见元素内部随机坐标，click 为真时再按下、随机停顿并抬起，返回是否找到该元素
 func (client *bidiClient) pointer(ctx context.Context, contextID, selector, pattern string, click bool, move int) (bool, error) {
 	located, err := client.callFunctionString(ctx, contextID, pointerTargetFunction, selector, pattern)
 	if err != nil || located == "" {
@@ -245,9 +263,14 @@ func (client *bidiClient) pointer(ctx context.Context, contextID, selector, patt
 	if err := json.Unmarshal([]byte(located), &target); err != nil {
 		return false, err
 	}
-	actions := []map[string]any{{"type": "pointerMove", "x": target.X, "y": target.Y, "duration": move}}
+	actualMove := move
+	if actualMove > 0 {
+		actualMove = max(60, move-25+rand.IntN(95))
+	}
+	actions := []map[string]any{{"type": "pointerMove", "x": target.X, "y": target.Y, "duration": actualMove}}
 	if click {
-		actions = append(actions, map[string]any{"type": "pointerDown", "button": 0}, map[string]any{"type": "pause", "duration": 60}, map[string]any{"type": "pointerUp", "button": 0})
+		hold := 45 + rand.IntN(45)
+		actions = append(actions, map[string]any{"type": "pointerDown", "button": 0}, map[string]any{"type": "pause", "duration": hold}, map[string]any{"type": "pointerUp", "button": 0})
 	}
 	_, err = client.command(ctx, "input.performActions", map[string]any{
 		"context": contextID,

@@ -126,10 +126,6 @@ func Start(ctx context.Context, options Options) (*Worker, error) {
 		return nil, err
 	}
 	if options.Headless && !options.liveView {
-		// 浏览器启动与首次载入按 interactiveFrameRate 刷新，Worker 就绪后降到 idleFrameDivisor 并停止标签页绘制
-		if _, err := worker.chromeEvaluate(ctx, idleRenderingExpression); err != nil {
-			return nil, fmt.Errorf("停止 Camoufox 标签页绘制: %w", err)
-		}
 		worker.idle = time.AfterFunc(idleMinimizeDelay, worker.minimizeMemory)
 		worker.settle = time.AfterFunc(readyMinimizeDelay, worker.minimizeMemory)
 	}
@@ -230,20 +226,19 @@ func (worker *Worker) placeWindow(ctx context.Context) error {
 	return err
 }
 
-// stopRendering 经浏览器界面层关闭当前标签页的 renderLayers，标签页不再光栅化与合成，页面的可见状态、焦点、动画帧与定时器不变
-func (worker *Worker) stopRendering(ctx context.Context) error {
-	_, err := worker.chromeEvaluate(ctx, "gBrowser.selectedBrowser.renderLayers = false")
-	return err
+// stopRendering 保持当前标签页的前台图层绘制（真人模式下不关闭 renderLayers，防止长流式生成期间出现后台冻结特征）
+func (worker *Worker) stopRendering(_ context.Context) error {
+	return nil
 }
 
-// interactiveFrameRate 是无头 Worker 的软件 vsync 频率，界面操作期间页面按此频率刷新，与官网页面在 60 Hz 显示器上相同
+// interactiveFrameRate 是无头 Worker 的软件 vsync 频率，页面全时按此频率刷新，与官网页面在 60 Hz 显示器上相同
 const interactiveFrameRate = 60
 
-// idleFrameDivisor 是无头 Worker 空闲时的 vsync 分频，页面每秒刷新 1 次
-const idleFrameDivisor = interactiveFrameRate
+// idleFrameDivisor 保持为 1，使无头 Worker 全时维持 60 Hz 刷新率
+const idleFrameDivisor = 1
 
-// idleRenderingExpression 把 vsync 分频设为 idleFrameDivisor 并停止选中标签页的绘制
-var idleRenderingExpression = fmt.Sprintf("Services.prefs.setIntPref('gfx.display.frame-rate-divisor', %d); gBrowser.selectedBrowser.renderLayers = false", idleFrameDivisor)
+// idleRenderingExpression 保持 vsync 分频为 1 并维持选中标签页的前台图层绘制
+var idleRenderingExpression = fmt.Sprintf("Services.prefs.setIntPref('gfx.display.frame-rate-divisor', %d); gBrowser.selectedBrowser.renderLayers = true", idleFrameDivisor)
 
 // idleMinimizeDelay 为无头 Worker 最后一次界面操作后发出 memory-pressure 的空闲时长，与 SpiderMonkey 后端的空闲收缩 GC 相同
 const idleMinimizeDelay = 5 * time.Minute
@@ -265,35 +260,26 @@ func (worker *Worker) minimizeMemory() {
 	}
 }
 
-// boostFrames 在无头 Worker 的界面操作期间把 vsync 分频设为 1 并恢复选中标签页的图层绘制，页面从下一次 vsync 起按 interactiveFrameRate 刷新，可信指针事件像可见标签页一样派发；返回的函数结束本次操作，全部操作结束后恢复 idleFrameDivisor 并停止选中标签页的绘制
-func (worker *Worker) boostFrames(ctx context.Context) (func(), error) {
+// boostFrames 在界面操作期间标记 frameBoosts 计数并重置空闲 GC 计时器，全时保持 60 Hz 与 renderLayers = true
+func (worker *Worker) boostFrames(_ context.Context) (func(), error) {
 	if !worker.options.Headless || worker.options.liveView {
 		return func() {}, nil
 	}
 	worker.frameMu.Lock()
-	defer worker.frameMu.Unlock()
-	if worker.frameBoosts == 0 {
-		if _, err := worker.chromeEvaluate(ctx, "Services.prefs.setIntPref('gfx.display.frame-rate-divisor', 1); gBrowser.selectedBrowser.renderLayers = true"); err != nil {
-			return nil, fmt.Errorf("提高 Camoufox 刷新帧率: %w", err)
-		}
+	if worker.frameBoosts == 0 && worker.idle != nil {
 		worker.idle.Stop()
 	}
 	worker.frameBoosts++
+	worker.frameMu.Unlock()
 	var once sync.Once
 	return func() {
 		once.Do(func() {
 			worker.frameMu.Lock()
 			defer worker.frameMu.Unlock()
 			worker.frameBoosts--
-			if worker.frameBoosts > 0 {
-				return
+			if worker.frameBoosts == 0 && worker.idle != nil {
+				worker.idle.Reset(idleMinimizeDelay)
 			}
-			restoreCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-			if _, err := worker.chromeEvaluate(restoreCtx, idleRenderingExpression); err != nil {
-				slog.Warn("恢复 Camoufox 刷新帧率失败", "error", err)
-			}
-			worker.idle.Reset(idleMinimizeDelay)
 		})
 	}, nil
 }
@@ -455,8 +441,9 @@ func (worker *Worker) Reload(ctx context.Context) error {
 func (worker *Worker) switchTab(contextID string, loaded loadedPage) error {
 	worker.mu.Lock()
 	previous := worker.contextID
+	model := strings.TrimPrefix(strings.TrimSpace(worker.options.Model), "models/")
 	worker.contextID, worker.page, worker.state, worker.pageCatalog = contextID, loaded.page, loaded.state, loaded.catalog
-	worker.chats[0], worker.selected = &chatTab{contextID: contextID, page: loaded.page}, contextID
+	worker.chats[0], worker.selected = &chatTab{contextID: contextID, page: loaded.page, model: model}, contextID
 	if previous == contextID {
 		worker.mu.Unlock()
 		return nil
@@ -593,6 +580,8 @@ func (worker *Worker) Close() error {
 	worker.mu.Unlock()
 	if worker.idle != nil {
 		worker.idle.Stop()
+	}
+	if worker.settle != nil {
 		worker.settle.Stop()
 	}
 	if client != nil && connection != nil {
@@ -665,8 +654,9 @@ func (worker *Worker) bootstrap(ctx context.Context, options Options, storage st
 	if err != nil {
 		return err
 	}
+	model := strings.TrimPrefix(strings.TrimSpace(options.Model), "models/")
 	worker.page, worker.state, worker.pageCatalog = loaded.page, loaded.state, loaded.catalog
-	worker.chats, worker.selected = []*chatTab{{contextID: contextID, page: loaded.page}}, contextID
+	worker.chats, worker.selected = []*chatTab{{contextID: contextID, page: loaded.page, model: model}}, contextID
 	return nil
 }
 

@@ -104,6 +104,39 @@ type functionContinuer interface {
 	ContinuesFunctionCall([]byte) bool
 }
 
+// chatContinuer 是能判断页面某标签页是否正在进行该多轮对话的 workerRuntime
+type chatContinuer interface {
+	ContinuesChat([]byte) bool
+}
+
+// PageChatAccount 返回当前 Camoufox 页面中正在进行 contents 所属多轮对话的账户 ID，供多账户调度器优先粘性复用同一账户
+func PageChatAccount(contents []Content) string {
+	if len(contents) == 0 {
+		return ""
+	}
+	encoded, err := encodeContents(contents)
+	if err != nil {
+		return ""
+	}
+	body, err := json.Marshal([]any{"models/gemini", encoded})
+	if err != nil {
+		return ""
+	}
+	matched := ""
+	pageWorkers.Range(func(key, value any) bool {
+		worker, ok := value.(*NativeWorker)
+		if !ok {
+			return true
+		}
+		if continuer, ok := worker.current().(chatContinuer); ok && continuer.ContinuesChat(body) {
+			matched, _ = key.(string)
+			return false
+		}
+		return true
+	})
+	return matched
+}
+
 // generator 返回在页面界面运行该请求的 runtime：Camoufox 后端、未带 proof 的 GenerateContent，最后一个轮次是带文本的 user 轮次，或是回应页面最后一轮函数调用的函数结果
 func (worker *NativeWorker) generator(request ProtectedRequest) (pageGenerator, bool) {
 	runtime := worker.current()
