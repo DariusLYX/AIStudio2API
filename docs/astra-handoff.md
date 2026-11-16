@@ -1,6 +1,6 @@
-# Mac 端双号常驻 & 真人网页操作版 — Astra 交接与维护指南
+# Mac 端多号顺序耗尽 & 真人网页操作版 — Astra 交接与维护指南
 
-本文档面向在 macOS 上维护本仓库的 AI Agent（Astra），说明本 Fork（`https://github.com/DariusLYX/AIStudio2API`）相对于上游 `Mag1cFall/AIStudio2API` 的定制改造、经过 Opus 5.5 两轮审查收敛后的设计不变量、Mac 部署配置以及日常维护注意事项。
+本文档面向在 macOS 上维护本仓库的 AI Agent（Astra），说明本 Fork（`https://github.com/DariusLYX/AIStudio2API`）相对于上游 `Mag1cFall/AIStudio2API` 的定制改造、经过 Opus 5.5 两轮审查收敛后的设计不变量、**与 Astra 在 Mac 本地既有“多号顺序耗尽”改动的对齐方式**，以及日常维护注意事项。
 
 ---
 
@@ -10,10 +10,12 @@
    - 用户使用自制聊天 UI，每次对话携带本地整理的记忆库（放在正文或 `system` 字段中，长度可能超过 25,000 字），并会不定期上传图片。
 2. **解决网页端切后台断流痛点**：
    - 浏览器直接打开 AI Studio 切到后台会因 Background Tab Throttling 导致生成中断失败；通过本服务在后台驱动独立 Camoufox 实例，使 AI Studio 标签页在浏览器内部全天候保持前台 60fps 激活与焦点态。
-3. **双号常驻、单线程真人节奏、严禁误触 Build 通道**：
-   - 后台常驻约 2 个 Google 账号，只走官网 `playground` 通道（绝不使用注入 `ask_question` 提示词的 `build` 通道）。
-4. **关于 AI Studio 云端聊天记录**：
-   - Worker 打开页面时固定携带 `?model=...&temporary=true`（官网无痕 Temporary Chat 模式，页面顶部带 `<ms-incognito-mode-indicator>` 标识），而正在进行中的多轮对话会保留在当前 Camoufox 页面中，直到开启新话题才点击 `New chat`。
+3. **支持 2~4+ 个账号严格按序耗尽（Drain-First / Waterfall）**：
+   - 后台可挂 2 个、3 个、4 个或更多 Google 账号。
+   - **核心调度铁律**：**永远优先死磕排在最前面的第 1 个可用账号（包含并发跑 2 个请求也在该账号的多标签页内完成），绝不因为并发或轮询去动后面的账号；只有当前账号因为额度用尽（429 进入 `cooldown`）或账号报错/受限（401/403/5xx 换号冷却）时，才顺位切到第 2 个号；第 2 个号用完再切第 3 个号、第 4 个号**。
+   - ⚠️ **给 Astra 的特别说明**：用户提到你在 Mac 本地已经帮他改过这套“尽力用完前一个号，除非额度用完或账号报错才切后面的号”的逻辑。本仓库已在 `internal/aistudio/accounts.go` 的 `classifyCandidatesLocked` 与 `tryAcquireLocked`（当 `ROUTING_STRATEGY=fill-first` 时）实装了该语义；你在 Mac 本地拉取/合并时，**请对比你本地已有的多号顺序切换改动，直接保留/融合你本地已验证稳定的账号切换与预热参数**。
+4. **严禁误触 Build 通道**：
+   - 只走官网 `playground` 通道，禁用注入 `ask_question` 提示词的 `build` 通道（`BUILD_NATIVE_NONSTREAM=false`）。
 
 ---
 
@@ -23,27 +25,29 @@
 | :--- | :--- | :--- |
 | **全时 60Hz 前台渲染 + 空闲 GC 保留**<br>`internal/camoufoxnative/worker.go` | 保持 `frame-rate-divisor = 1` 与 `renderLayers = true` | 上游在 `waitSent`（请求刚发出、流式生成尚在进行中）即把无头浏览器降为 1 FPS 并设置 `renderLayers = false`。现改为全时保持 60Hz 与 `renderLayers = true`，同时保留 `worker.idle` 5 分钟空闲 `memory-pressure` GC 回收，兼顾 7×24 常驻内存健康与流式渲染一致性。 |
 | **生物特征随机化**<br>`internal/camoufoxnative/page.go` | 点击坐标随机分布 + 移动/按键时长抖动 | `pointerTargetFunction` 从死锁元素几何正中心 `(0.5, 0.5)` 改为 `[0.3, 0.7]` 安全区随机落点；鼠标移动耗时（`95~214ms`）、点击按压（`45~89ms`）与 `Ctrl+V`/`Ctrl+A` 按键停顿（`shortcutKeyActions`）均改为随机分布，且 100% 走 WebDriver BiDi 物理可信输入（`isTrusted: true`）。 |
-| **多轮原地续聊与脏状态自愈**<br>`internal/camoufoxnative/generate.go` | 取消每轮结束自动 `resetChat` + `tab.dirty` 与 `chatEmptyExpression` 校验 | 1. `releaseChat` 不再在每轮普通回答结束后 0 秒秒点 `New chat` 清空页面，对话保留在当前页；下一轮到来时 `nextChatAction` 自动判定 `chatContinue`，在原页面底部继续输入。<br>2. **脏状态自愈（B1 & N1 修复）**：若上一轮 `waitSent` 失败或上游返回非 200，标记 `tab.dirty = true`；下一轮 `startTurn` 时实测页面 `chatEmptyExpression`，若页面已空则直接清除 `dirty` 并走 `chatContinue`，若页面非空且需要重开则执行 `newChat` 清空。<br>3. **流式分块与非文本 Part 精确匹配（H5 / M2 / N2 修复）**：`visibleContentText` 跳过 `part[12]` 思考块并使用无空格拼接 `strings.Join(values, "")` 对齐流式分块还原的模型回复；`nonTextTurnParts` 剥离 `part[1]`（文本）、`part[12]`（思考）与 `part[14]`（思考签名）后严格比对图片/文件/函数调用（`part[10]`）与函数结果（`part[11]`）。 |
-| **长记忆与图片无损送达**<br>`internal/camoufoxnative/generate.go` | `promptHead` 可信粘贴 + 完整正文与同出口图片挂载 | 输入框以 `promptHead`（最后一轮前 25,000 字）执行物理 `Ctrl+V` 粘贴（与页面伴随 `CountTokens` 严格一致，且不触发 `>25k` 字转附件阻塞），任意长度的完整长记忆及经同账户 Firefox 158 指纹上传的图片引用通过请求正文完整发出。 |
-| **双号多轮会话粘性路由**<br>`internal/aistudio/runtime_native.go`<br>`internal/app/runtime.go`<br>`internal/camoufoxnative/generate.go` | `PageChatAccount` + `acquireChat` 标签页亲和匹配 | 1. 多轮对话进入调度时，若无内联媒体优先绑定，`PageChatAccount` 检查哪个账户的 Camoufox 标签页正好停留在上一轮对话（`ContinuesChat`），将其设为 `preferredAccountID`。<br>2. `acquireChat` 优先选取可续接当前 `contents` 的标签页，其次选取空白标签页。 |
+| **多轮原地续聊、多标签页并发与脏状态自愈**<br>`internal/camoufoxnative/generate.go` | 取消每轮结束自动 `resetChat` + `tab.dirty` 与 `chatEmptyExpression` 校验 + `acquireChat` 亲和匹配 | 1. `releaseChat` 不再在每轮普通回答结束后 0 秒秒点 `New chat` 清空页面，对话保留在当前标签页；下一轮到来时 `nextChatAction` 自动判定 `chatContinue`，在原页面底部继续输入。<br>2. 同账号并发跑 2 个请求或交替聊多个话题时，`acquireChat` 优先选取可续接当前 `contents` 的标签页，全部忙碌时自动在同浏览器新建第 2 个标签页（Multi-Tab）并行运行。<br>3. **脏状态自愈（B1 & N1 修复）**：若上一轮 `waitSent` 失败或上游返回非 200，标记 `tab.dirty = true`；下一轮 `startTurn` 时实测页面 `chatEmptyExpression`，若页面已空则直接清除 `dirty` 并走 `chatContinue`，若页面非空且需要重开则执行 `newChat` 清空。<br>4. **流式分块与非文本 Part 精确匹配（H5 / M2 / N2 修复）**：`visibleContentText` 跳过 `part[12]` 思考块并使用无空格拼接 `strings.Join(values, "")` 对齐流式分块还原的模型回复；`nonTextTurnParts` 剥离 `part[1]`（文本）、`part[12]`（思考）与 `part[14]`（思考签名）后严格比对图片/文件/函数调用（`part[10]`）与函数结果（`part[11]`）。 |
+| **多号严格顺序耗尽调度（1→2→3→4 号）**<br>`internal/aistudio/accounts.go` | `fill-first` 严格锁死当前顺位首号 | 在 `classifyCandidatesLocked` 与 `tryAcquireLocked` 中，当 `ROUTING_STRATEGY=fill-first` 时，按 `ACCOUNT_ORDER`（及账户 ID 排序）找到第一个未冷却且狀態为 `ready` 的账户后立即 `break` 截断后续候选；即便该账户当前并发槽位满也优先排队等待它，**绝不溢出到第 2、3、4 个号，除非当前号因额度耗尽或账号错误进入冷却/不可用状态**。 |
 
 ---
 
-## 三、 macOS 部署与 `.env` 推荐配置
-
-在 Mac 上拉取本仓库后，按如下 `.env` 配置运行（双号常驻 + Camoufox 模式）：
+## 三、 macOS 部署与 `.env` 推荐配置（支持 2~4+ 个号）
 
 ```ini
 # 强制使用 Camoufox 浏览器后端
 WAA_BACKEND=camoufox
 
-# 双号常驻预热：2 个号保持常驻，单号允许 2 并发（多并发或多会话交替时自动在同浏览器开新 Tab 并保持各 Tab 历史）
-WARM_WORKER_LIMIT=2
-MAX_ACTIVE_WORKERS=2
+# 单账号并发槽位数（设为 2 时，同一个号可开 2 个标签页同时跑 2 个并发请求并保持 2 个活跃对话不互冲）
 PER_ACCOUNT_CONCURRENCY=2
 
-# 账号粘性优先（配合 PageChatAccount + acquireChat 多标签页亲和匹配，多对话同时交替聊也不会互相冲掉）
+# 严格按序耗尽策略：优先死磕第 1 个号，除非额度用完或报错才切第 2、3、4 个号
 ROUTING_STRATEGY=fill-first
+
+# 可选：显式指定 1、2、3、4 号的使用先后顺序（留空则按邮箱字母序依次耗尽）
+# ACCOUNT_ORDER=first@gmail.com,second@gmail.com,third@gmail.com,fourth@gmail.com
+
+# 常驻预热与最大 Worker 数（默认 Camoufox 为 5 和 10，天然支持挂 2~5 个号；若 Astra 本地已调优按需预热策略，请保留 Astra 本地设置）
+# WARM_WORKER_LIMIT=1
+# MAX_ACTIVE_WORKERS=4
 
 # 关闭首字超时并发备用请求（避免一个问题同时在两个号上点 Run）
 FIRST_EVENT_HEDGE=off
@@ -53,35 +57,15 @@ UPSTREAM_CHANNELS=playground
 BUILD_NATIVE_NONSTREAM=false
 ```
 
-### Mac 构建与启动命令
-
-1. **直接基于源码构建（macOS）**：
-   参见根目录 `README.md` 的「方式三：Linux 与 macOS 源码构建」，需要 Xcode Command Line Tools、Go 1.27.3+、Node.js 22+，并下载对应架构（`darwin-arm64` 或 `darwin-amd64`）的 `spidermonkey` 与 `libwebp` 静态库后执行：
-   ```bash
-   cd web && npm ci && npm run build && cd ..
-   export CGO_CPPFLAGS="-I$PWD/spidermonkey/include -I$PWD/libwebp/include"
-   export CGO_LDFLAGS="-L$PWD/spidermonkey/lib -L$PWD/libwebp/lib"
-   go build -o aistudio2api ./cmd/aistudio2api
-   ```
-2. **添加两个 Google 账号**：
-   ```bash
-   ./aistudio2api setup --login
-   ```
-   登录会自动打开隔离的 Camoufox 窗口，登录并完成 Drive 授权后保存至 `auth/<邮箱>/`。
-
 ---
 
-## 四、 Astra 后续维护与合并上游指南
+## 四、 Astra 交接与合并执行步骤
 
-1. **同步上游改动**：
-   ```bash
-   git remote add upstream https://github.com/Mag1cFall/AIStudio2API.git
-   git fetch upstream
-   ```
-   合并 `upstream/main` 时，重点保护上述改造点（集中在 `internal/camoufoxnative/worker.go`、`page.go`、`generate.go`、`internal/aistudio/runtime_native.go` 与 `internal/app/runtime.go`）。
-2. **回归测试**：
-   每次修改或合并后运行：
+1. **拉取本仓库并与 Mac 本地改动对齐**：
+   - 本仓库远端：`https://github.com/DariusLYX/AIStudio2API.git`（`main` 分支）。
+   - 如果 Mac 本地已有正在运行的目录与 Astra 之前修改过的“多号顺序耗尽/故障切换”代码，请对比 `internal/aistudio/accounts.go` 与 `internal/app/`，将本仓库 `internal/camoufoxnative/` 的全套拟真改造（`worker.go`、`page.go`、`generate.go`、`page_test.go`）与你本地的多号调度无缝合入。
+2. **运行单元测试验证**：
    ```bash
    go test -v ./internal/camoufoxnative/... ./internal/config/...
    ```
-   确保全部测试通过。
+   确认全部用例 PASS 后重新编译 `aistudio2api` 并重启服务。
