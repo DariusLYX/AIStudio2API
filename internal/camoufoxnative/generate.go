@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math/rand/v2"
 	"net/http"
 	"strings"
 	"time"
@@ -391,7 +392,7 @@ func (worker *Worker) generate(ctx context.Context, tab *chatTab, turn GenerateT
 		Proof:      proof,
 		Body: &protectedResponseBody{
 			ctx: bodyCtx, cancel: cancelBody, worker: worker, contextID: tab.contextID, page: tab.page, requestID: requestID, channel: channel,
-			stop: func() error { return worker.stopTurn(tab) }, release: func(done, call bool) { worker.releaseChat(tab, false) },
+			stop: func() error { return worker.stopTurn(tab) }, release: func(done, call bool) { worker.releaseChat(tab, done && status == http.StatusOK && !call) },
 		},
 	}, nil
 }
@@ -459,6 +460,10 @@ func (worker *Worker) startTurn(ctx context.Context, tab *chatTab, turn Generate
 			if err := worker.click(input, tab.contextID, promptBoxSelector, "", "官网输入框", pointerMoveDuration); err != nil {
 				return err
 			}
+			// 鼠标点击输入框后切到左手按 Ctrl+V 的生理微停顿（65~130ms）
+			if err := waitContext(ctx, time.Duration(65+rand.IntN(65))*time.Millisecond); err != nil {
+				return err
+			}
 		}
 		worker.mu.Lock()
 		unsent := tab.unsent
@@ -474,6 +479,10 @@ func (worker *Worker) startTurn(ctx context.Context, tab *chatTab, turn Generate
 		}
 		if err := worker.waitRunnable(ctx, tab); err != nil {
 			return fmt.Errorf("等待官网 Run 按钮启用: %w", err)
+		}
+		// 左手松开 Ctrl+V 后切回右手移动鼠标去点 Run 按钮的手眼协调停顿（110~230ms）
+		if err := waitContext(ctx, time.Duration(110+rand.IntN(120))*time.Millisecond); err != nil {
+			return err
 		}
 	}
 	if err := worker.arm(ctx, tab, turn, requestID); err != nil {
@@ -746,21 +755,42 @@ func (worker *Worker) acquireChat(ctx context.Context, contents []json.RawMessag
 	return tab, nil
 }
 
-// releaseChat 结束标签页上的一轮对话；completed 表示本轮成功完成，此时在后台新开对话，下一轮在空白对话中直接输入
+// releaseChat 结束标签页上的一轮对话；立即释放标签页忙碌状态与请求计数，completed 为真时在后台空闲期异步模拟阅读浏览（将鼠标移回对话区并轻滚滚轮），绝不阻塞响应或下一轮请求
 func (worker *Worker) releaseChat(tab *chatTab, completed bool) {
 	worker.mu.Lock()
-	reset := completed && !worker.closed
-	if reset {
-		tab.resetting = make(chan struct{})
-	} else {
-		tab.busy = false
-	}
+	shouldBrowse := completed && !worker.closed
+	tab.busy = false
+	tab.runHovered = false
 	worker.mu.Unlock()
-	if !reset {
-		worker.finishRequest(tab.contextID)
+	worker.finishRequest(tab.contextID)
+	if shouldBrowse {
+		go worker.simulatePostTurnReading(tab)
+	}
+}
+
+// simulatePostTurnReading 在回答完成后的空闲期异步模拟真人阅读行为（移开鼠标 + 滚轮浏览）；若期间有新请求到来则立即让路退出
+func (worker *Worker) simulatePostTurnReading(tab *chatTab) {
+	delay := time.Duration(900+rand.IntN(1300)) * time.Millisecond
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	<-timer.C
+	if worker.inputWaiters.Load() > 0 {
 		return
 	}
-	go worker.resetChat(tab)
+	if !worker.inputMu.TryLock() {
+		return
+	}
+	defer worker.inputMu.Unlock()
+	worker.mu.Lock()
+	active := !worker.closed && !tab.busy && !tab.dirty && worker.selected == tab.contextID && worker.inputWaiters.Load() == 0
+	client := worker.client
+	worker.mu.Unlock()
+	if !active || client == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	_ = client.simulateReading(ctx, tab.contextID)
 }
 
 // resetChat 像官网用户开始新话题一样在标签页上点 New chat 并丢弃当前对话，结束后标签页变为空闲

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"math/rand/v2"
 	"strings"
 )
@@ -250,7 +251,59 @@ const pointerTargetFunction = `(selector, pattern) => {
 // pointerMoveDuration 是可信指针从别处移到目标元素所用的基准毫秒数
 const pointerMoveDuration = 120
 
-// pointer 以可信指针带随机时长移到 selector 与 pattern 匹配的可见元素内部随机坐标，click 为真时再按下、随机停顿并抬起，返回是否找到该元素
+// humanPointerMoves 生成从 (fromX, fromY) 到 (toX, toY) 的多段二次贝塞尔微弧度、慢-快-慢加减速 pointerMove 动作序列
+func humanPointerMoves(fromX, fromY, toX, toY, totalDuration int) []map[string]any {
+	dx := float64(toX - fromX)
+	dy := float64(toY - fromY)
+	dist := math.Hypot(dx, dy)
+	if totalDuration <= 0 || dist < 12 {
+		return []map[string]any{{"type": "pointerMove", "x": toX, "y": toY, "duration": max(0, totalDuration)}}
+	}
+	steps := 5 + rand.IntN(3) // 5~7 段插值
+	// 法向随机弧度偏移（距离的 -12% ~ +12%，钳制在 [-42, 42] 像素内）
+	nx, ny := -dy/dist, dx/dist
+	spread := min(42.0, dist*0.12)
+	offset := (rand.Float64()*2 - 1) * spread
+	along := 0.35 + rand.Float64()*0.30
+	ctrlX := float64(fromX) + dx*along + nx*offset
+	ctrlY := float64(fromY) + dy*along + ny*offset
+
+	// 两端慢、中间快的时间权重（模拟人类启动加速与接近目标减速对准）
+	weights := make([]float64, steps)
+	var weightSum float64
+	for index := 0; index < steps; index++ {
+		mid := float64(steps-1) / 2.0
+		edge := math.Abs(float64(index)-mid) / max(1.0, mid)
+		w := 0.75 + 0.65*edge
+		weights[index] = w
+		weightSum += w
+	}
+
+	moves := make([]map[string]any, 0, steps)
+	remaining := totalDuration
+	for step := 1; step <= steps; step++ {
+		t := float64(step) / float64(steps)
+		// Smoothstep 缓入缓出空间采样
+		s := t * t * (3 - 2*t)
+		inv := 1 - s
+		x := int(math.Round(inv*inv*float64(fromX) + 2*inv*s*ctrlX + s*s*float64(toX)))
+		y := int(math.Round(inv*inv*float64(fromY) + 2*inv*s*ctrlY + s*s*float64(toY)))
+		if step == steps {
+			x, y = toX, toY
+		}
+		dur := int(math.Round(float64(totalDuration) * weights[step-1] / weightSum))
+		if step == steps {
+			dur = max(10, remaining)
+		} else {
+			dur = max(10, min(dur, remaining-10*(steps-step)))
+			remaining -= dur
+		}
+		moves = append(moves, map[string]any{"type": "pointerMove", "x": x, "y": y, "duration": dur})
+	}
+	return moves
+}
+
+// pointer 以可信指针沿多段贝塞尔弧线移到 selector 与 pattern 匹配的可见元素内部随机坐标，click 为真时再按下、随机停顿并抬起，返回是否找到该元素
 func (client *bidiClient) pointer(ctx context.Context, contextID, selector, pattern string, click bool, move int) (bool, error) {
 	located, err := client.callFunctionString(ctx, contextID, pointerTargetFunction, selector, pattern)
 	if err != nil || located == "" {
@@ -265,9 +318,10 @@ func (client *bidiClient) pointer(ctx context.Context, contextID, selector, patt
 	}
 	actualMove := move
 	if actualMove > 0 {
-		actualMove = max(60, move-25+rand.IntN(95))
+		actualMove = max(80, move-20+rand.IntN(95))
 	}
-	actions := []map[string]any{{"type": "pointerMove", "x": target.X, "y": target.Y, "duration": actualMove}}
+	fromX, fromY := client.pointerPosition()
+	actions := humanPointerMoves(fromX, fromY, target.X, target.Y, actualMove)
 	if click {
 		hold := 45 + rand.IntN(45)
 		actions = append(actions, map[string]any{"type": "pointerDown", "button": 0}, map[string]any{"type": "pause", "duration": hold}, map[string]any{"type": "pointerUp", "button": 0})
@@ -276,7 +330,56 @@ func (client *bidiClient) pointer(ctx context.Context, contextID, selector, patt
 		"context": contextID,
 		"actions": []map[string]any{{"type": "pointer", "id": "mouse", "parameters": map[string]any{"pointerType": "mouse"}, "actions": actions}},
 	})
+	if err == nil {
+		client.setPointerPosition(target.X, target.Y)
+	}
 	return true, err
+}
+
+// simulateReading 在一轮回答结束后的空闲期，将鼠标从 Run 按钮沿弧线移回最新对话阅读区，并执行轻量滚轮浏览
+func (client *bidiClient) simulateReading(ctx context.Context, contextID string) error {
+	located, err := client.callFunctionString(ctx, contextID, pointerTargetFunction, lastTurnSelector, "")
+	if err != nil || located == "" {
+		return err
+	}
+	var target struct {
+		X int `json:"x"`
+		Y int `json:"y"`
+	}
+	if err := json.Unmarshal([]byte(located), &target); err != nil {
+		return err
+	}
+	fromX, fromY := client.pointerPosition()
+	moveDur := 160 + rand.IntN(140)
+	moves := humanPointerMoves(fromX, fromY, target.X, target.Y, moveDur)
+	if _, err := client.command(ctx, "input.performActions", map[string]any{
+		"context": contextID,
+		"actions": []map[string]any{{"type": "pointer", "id": "mouse", "parameters": map[string]any{"pointerType": "mouse"}, "actions": moves}},
+	}); err != nil {
+		return err
+	}
+	client.setPointerPosition(target.X, target.Y)
+	// 70% 概率在阅读区做一次向上轻滚浏览再滚回底部
+	if rand.IntN(10) < 7 {
+		deltaUp := -(90 + rand.IntN(150))
+		deltaDown := -deltaUp
+		durUp := 110 + rand.IntN(90)
+		pause := 200 + rand.IntN(260)
+		durDown := 110 + rand.IntN(90)
+		_, _ = client.command(ctx, "input.performActions", map[string]any{
+			"context": contextID,
+			"actions": []map[string]any{{
+				"type": "wheel",
+				"id":   "wheel",
+				"actions": []map[string]any{
+					{"type": "scroll", "x": target.X, "y": target.Y, "deltaX": 0, "deltaY": deltaUp, "duration": durUp},
+					{"type": "pause", "duration": pause},
+					{"type": "scroll", "x": target.X, "y": target.Y, "deltaX": 0, "deltaY": deltaDown, "duration": durDown},
+				},
+			}},
+		})
+	}
+	return nil
 }
 
 // dismissOverlaysExpression 关闭官网已知且可交互的启动弹层：G1 欢迎对话框、引导浏览浮层与 Cookie 提示条，提示条有拒绝按钮时拒绝，只有确认按钮时确认

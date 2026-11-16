@@ -104,3 +104,27 @@ func TestGeneratePrompt(t *testing.T) {
 	}
 }
 
+// TestHumanPointerMoves 验证多段二次贝塞尔弧线轨迹与慢-快-慢时间分配
+func TestHumanPointerMoves(t *testing.T) {
+	moves := humanPointerMoves(100, 120, 620, 480, 180)
+	if len(moves) < 5 || len(moves) > 7 {
+		t.Fatalf("期望 5~7 段移动轨迹，实际为 %d 段", len(moves))
+	}
+	total := 0
+	for index, move := range moves {
+		dur, ok := move["duration"].(int)
+		if !ok || dur < 10 {
+			t.Fatalf("第 %d 段 duration 无效: %v", index, move["duration"])
+		}
+		total += dur
+	}
+	if total != 180 {
+		t.Fatalf("轨迹总耗时 = %d, want 180", total)
+	}
+	last := moves[len(moves)-1]
+	if last["x"] != 620 || last["y"] != 480 {
+		t.Fatalf("终点坐标 = (%v, %v), want (620, 480)", last["x"], last["y"])
+	}
+}
+
+
