@@ -8,7 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"math/rand/v2"
+	mathrand "math/rand/v2"
 	"net/http"
 	"strings"
 	"time"
@@ -461,7 +461,7 @@ func (worker *Worker) startTurn(ctx context.Context, tab *chatTab, turn Generate
 				return err
 			}
 			// 鼠标点击输入框后切到左手按 Ctrl+V 的生理微停顿（65~130ms）
-			if err := waitContext(ctx, time.Duration(65+rand.IntN(65))*time.Millisecond); err != nil {
+			if err := waitContext(ctx, time.Duration(65+mathrand.IntN(65))*time.Millisecond); err != nil {
 				return err
 			}
 		}
@@ -481,7 +481,7 @@ func (worker *Worker) startTurn(ctx context.Context, tab *chatTab, turn Generate
 			return fmt.Errorf("等待官网 Run 按钮启用: %w", err)
 		}
 		// 左手松开 Ctrl+V 后切回右手移动鼠标去点 Run 按钮的手眼协调停顿（110~230ms）
-		if err := waitContext(ctx, time.Duration(110+rand.IntN(120))*time.Millisecond); err != nil {
+		if err := waitContext(ctx, time.Duration(110+mathrand.IntN(120))*time.Millisecond); err != nil {
 			return err
 		}
 	}
@@ -770,7 +770,7 @@ func (worker *Worker) releaseChat(tab *chatTab, completed bool) {
 
 // simulatePostTurnReading 在回答完成后的空闲期异步模拟真人阅读行为（移开鼠标 + 滚轮浏览）；若期间有新请求到来则立即让路退出
 func (worker *Worker) simulatePostTurnReading(tab *chatTab) {
-	delay := time.Duration(900+rand.IntN(1300)) * time.Millisecond
+	delay := time.Duration(900+mathrand.IntN(1300)) * time.Millisecond
 	timer := time.NewTimer(delay)
 	defer timer.Stop()
 	<-timer.C
