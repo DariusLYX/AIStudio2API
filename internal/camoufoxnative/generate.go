@@ -26,13 +26,11 @@ type GenerateTurn struct {
 type chatTab struct {
 	contextID string
 	page      pageHandle
-	// model 是当前标签页打开的官网模型 ID（不含 models/ 前缀）
-	model string
 	// busy 表示标签页正在运行一轮对话
 	busy bool
 	// contents 是标签页上一轮发出的 GenerateContent 的 contents，页面没有对话或上一轮以上游错误结束时为空
 	contents []json.RawMessage
-	// dirty 表示上一轮请求在点击 Run 后失败或返回非 200，页面残留未同步的对话轮次，下一轮需先点 New chat 清空
+	// dirty 表示上一轮请求在点击 Run 后失败或返回非 200，页面可能残留未同步的对话轮次
 	dirty bool
 	// resetting 在一轮对话结束后于后台新开对话期间非空，新开结束时关闭
 	resetting chan struct{}
@@ -104,15 +102,6 @@ func GeneratePrompt(body []byte) (string, bool) {
 	return text, text != ""
 }
 
-// wireSystemText 返回 GenerateContent 正文第 5 槽（SystemInstruction）的文本，供新对话首轮合并入输入框提示词
-func wireSystemText(body []byte) string {
-	var fields []json.RawMessage
-	if json.Unmarshal(body, &fields) != nil || len(fields) <= 5 || bytes.Equal(bytes.TrimSpace(fields[5]), []byte("null")) {
-		return ""
-	}
-	return strings.TrimSpace(contentText(fields[5]))
-}
-
 // lastUserParts 返回 GenerateContent 正文最后一个轮次是 user 轮次时它的各 Part，否则为 nil
 func lastUserParts(body []byte) [][]json.RawMessage {
 	contents, err := generateContents(body)
@@ -153,7 +142,7 @@ func GenerateFiles(body []byte) []string {
 	return files
 }
 
-// visibleContentText 返回 wire 轮次中非思考 Part（part[11] != 1）的可见文本（按空串拼接以兼容流式分块还原的模型轮）
+// visibleContentText 返回 wire 轮次中非思考 Part（part[12] 为空）的可见文本（按空串拼接以兼容流式分块还原的模型轮）
 func visibleContentText(content json.RawMessage) string {
 	var fields []json.RawMessage
 	var parts [][]json.RawMessage
@@ -162,7 +151,7 @@ func visibleContentText(content json.RawMessage) string {
 	}
 	values := make([]string, 0, len(parts))
 	for _, part := range parts {
-		if len(part) > 11 && bytes.Equal(bytes.TrimSpace(part[11]), []byte("1")) {
+		if len(part) > 12 && !bytes.Equal(bytes.TrimSpace(part[12]), []byte("null")) {
 			continue
 		}
 		var text string
@@ -173,7 +162,7 @@ func visibleContentText(content json.RawMessage) string {
 	return strings.TrimSpace(strings.Join(values, ""))
 }
 
-// nonTextPartDigest 返回 wire 轮次中除思考 Part、思考签名与纯文本之外的其余 Part（如图片、文件、函数调用与函数结果）的规范化列表
+// nonTextTurnParts 返回 wire 轮次中除思考 Part（part[12]）、思考签名（part[14]）与纯文本（part[1]）之外的其余 Part（如图片、文件、函数调用 part[10] 与函数结果 part[11]）的规范化列表
 func nonTextTurnParts(content json.RawMessage) string {
 	var fields []json.RawMessage
 	var parts [][]json.RawMessage
@@ -182,7 +171,7 @@ func nonTextTurnParts(content json.RawMessage) string {
 	}
 	var kept [][]json.RawMessage
 	for _, part := range parts {
-		if len(part) > 11 && bytes.Equal(bytes.TrimSpace(part[11]), []byte("1")) {
+		if len(part) > 12 && !bytes.Equal(bytes.TrimSpace(part[12]), []byte("null")) {
 			continue
 		}
 		cleaned := make([]json.RawMessage, len(part))
@@ -190,8 +179,8 @@ func nonTextTurnParts(content json.RawMessage) string {
 		if len(cleaned) > 1 {
 			cleaned[1] = json.RawMessage("null")
 		}
-		if len(cleaned) > 10 {
-			cleaned[10] = json.RawMessage("null")
+		if len(cleaned) > 14 {
+			cleaned[14] = json.RawMessage("null")
 		}
 		for len(cleaned) > 0 && bytes.Equal(bytes.TrimSpace(cleaned[len(cleaned)-1]), []byte("null")) {
 			cleaned = cleaned[:len(cleaned)-1]
@@ -429,15 +418,25 @@ func (worker *Worker) startTurn(ctx context.Context, tab *chatTab, turn Generate
 	action := nextChatAction(tab.contents, contents)
 	hovered := tab.runHovered
 	tab.runHovered = false
-	if (tab.unsent && action == chatRerun) || dirty {
+	if tab.unsent && action == chatRerun {
 		action = chatNew
 	}
 	worker.mu.Unlock()
 	if turn.Result != "" {
 		return worker.submitResult(ctx, input, tab, turn, requestID)
 	}
-	if previousEmpty && action != chatNew {
-		if empty, err := client.evaluateBool(input, tab.contextID, chatEmptyExpression); err == nil && !empty {
+	if dirty || previousEmpty || action == chatNew {
+		empty, err := client.evaluateBool(input, tab.contextID, chatEmptyExpression)
+		if err != nil {
+			return fmt.Errorf("检查官网对话轮次是否为空: %w", err)
+		}
+		if empty {
+			worker.mu.Lock()
+			tab.dirty = false
+			tab.contents = nil
+			worker.mu.Unlock()
+			action = chatContinue
+		} else {
 			action = chatNew
 		}
 	}
@@ -446,7 +445,6 @@ func (worker *Worker) startTurn(ctx context.Context, tab *chatTab, turn Generate
 		if err := worker.newChat(input, tab); err != nil {
 			return err
 		}
-		previousEmpty = true
 		if err := ctx.Err(); err != nil {
 			return err
 		}
@@ -471,13 +469,7 @@ func (worker *Worker) startTurn(ctx context.Context, tab *chatTab, turn Generate
 				return fmt.Errorf("全选官网输入框中未发出的输入: %w", err)
 			}
 		}
-		inputPrompt := prompt
-		if previousEmpty {
-			if sys := wireSystemText(turn.Body); sys != "" {
-				inputPrompt = sys + "\n\n" + inputPrompt
-			}
-		}
-		if err := pastePrompt(input, client, tab.contextID, promptHead(inputPrompt)); err != nil {
+		if err := pastePrompt(input, client, tab.contextID, promptHead(prompt)); err != nil {
 			return err
 		}
 		if err := worker.waitRunnable(ctx, tab); err != nil {
@@ -743,8 +735,7 @@ func (worker *Worker) acquireChat(ctx context.Context, contents []json.RawMessag
 	if err != nil {
 		return nil, errors.Join(err, worker.closeTab(contextID))
 	}
-	model := strings.TrimPrefix(strings.TrimSpace(options.Model), "models/")
-	tab := &chatTab{contextID: contextID, page: loaded.page, model: model, busy: true}
+	tab := &chatTab{contextID: contextID, page: loaded.page, busy: true}
 	worker.mu.Lock()
 	defer worker.mu.Unlock()
 	if worker.closed {

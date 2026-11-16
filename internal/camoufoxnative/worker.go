@@ -441,9 +441,8 @@ func (worker *Worker) Reload(ctx context.Context) error {
 func (worker *Worker) switchTab(contextID string, loaded loadedPage) error {
 	worker.mu.Lock()
 	previous := worker.contextID
-	model := strings.TrimPrefix(strings.TrimSpace(worker.options.Model), "models/")
 	worker.contextID, worker.page, worker.state, worker.pageCatalog = contextID, loaded.page, loaded.state, loaded.catalog
-	worker.chats[0], worker.selected = &chatTab{contextID: contextID, page: loaded.page, model: model}, contextID
+	worker.chats[0], worker.selected = &chatTab{contextID: contextID, page: loaded.page}, contextID
 	if previous == contextID {
 		worker.mu.Unlock()
 		return nil
@@ -654,9 +653,8 @@ func (worker *Worker) bootstrap(ctx context.Context, options Options, storage st
 	if err != nil {
 		return err
 	}
-	model := strings.TrimPrefix(strings.TrimSpace(options.Model), "models/")
 	worker.page, worker.state, worker.pageCatalog = loaded.page, loaded.state, loaded.catalog
-	worker.chats, worker.selected = []*chatTab{{contextID: contextID, page: loaded.page, model: model}}, contextID
+	worker.chats, worker.selected = []*chatTab{{contextID: contextID, page: loaded.page}}, contextID
 	return nil
 }
 

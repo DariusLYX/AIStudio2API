@@ -42,6 +42,8 @@
 
 **三步开始使用**：下载 [Releases](https://github.com/Mag1cFall/AIStudio2API/releases) 并启动 → 在“账户”页添加 Google 账户 → 点击“启动服务”，把 `http://127.0.0.1:2048` 作为 OpenAI、Anthropic 或 Gemini 客户端的 Base URL
 
+> 📌 **Mac 端 Astra 交接与维护入口**：详见 [Mac 端双号常驻 & 真人网页操作版 — Astra 交接与维护指南](docs/astra-handoff.md)
+
 ## 🧩 Google 反代全家桶
 
 三个项目分别接入 AI Studio、Gemini 网页版与 Antigravity，把各自的模型转为 OpenAI、Anthropic 与 Gemini 兼容接口，供 Claude Code、Codex 等 Agent 客户端和 SillyTavern 等酒馆前端使用。
