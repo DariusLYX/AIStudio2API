@@ -2844,6 +2844,9 @@ func (p *AccountPool) classifyCandidatesLocked(
 		default:
 			groups.StandbyReady = append(groups.StandbyReady, account.ID)
 		}
+		if p.routingStrategy == "fill-first" {
+			break
+		}
 	}
 	return groups, nil
 }
@@ -2856,20 +2859,17 @@ func (p *AccountPool) tryAcquireLocked(selection AccountSelection, now time.Time
 	waitable := false
 	var earliest time.Time
 	candidates := p.channelCandidatesLocked(indices, selection)
-	sort.SliceStable(candidates, func(left, right int) bool {
-		return p.accounts[candidates[left].index].ID == selection.PreferredAccountID && p.accounts[candidates[right].index].ID != selection.PreferredAccountID
-	})
+	if p.routingStrategy != "fill-first" {
+		sort.SliceStable(candidates, func(left, right int) bool {
+			return p.accounts[candidates[left].index].ID == selection.PreferredAccountID && p.accounts[candidates[right].index].ID != selection.PreferredAccountID
+		})
+	}
 	for _, candidate := range candidates {
 		account := p.accounts[candidate.index]
 		if !selection.anyState && (!account.Config.Enabled || account.State != AccountReady) {
 			continue
 		}
 		if selection.ModelID != "" && !p.channelSupportsLocked(account, candidate.channel, selection) {
-			continue
-		}
-		waitable = true
-		if account.exclusive || account.exclusiveWaiters > 0 || account.authRefreshers > 0 || account.active >= p.perAccountConcurrency ||
-			candidate.channel == ChannelAssistant && account.assistantBusy {
 			continue
 		}
 		if selection.ResourceID == "" && !selection.anyState {
@@ -2881,6 +2881,14 @@ func (p *AccountPool) tryAcquireLocked(selection AccountSelection, now time.Time
 			}
 		}
 		if candidate.channel != selection.PreferredChannel && p.preferredChannelOpenLocked(account, selection, now) {
+			continue
+		}
+		waitable = true
+		if account.exclusive || account.exclusiveWaiters > 0 || account.authRefreshers > 0 || account.active >= p.perAccountConcurrency ||
+			candidate.channel == ChannelAssistant && account.assistantBusy {
+			if p.routingStrategy == "fill-first" {
+				break
+			}
 			continue
 		}
 		refreshRuntime := false
