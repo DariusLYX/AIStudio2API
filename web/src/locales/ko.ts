@@ -443,6 +443,9 @@ export const messages: Record<TranslationKey, string> = {
   'settings.accountOrder': '계정 순서',
   'settings.accountOrderHelp':
     '같은 계정 우선일 때 이 순서대로 사용하며, 한도에 도달했거나 쿨다운 중이거나 사용할 수 없으면 다음 계정으로 전환합니다',
+  'settings.accountOrderRules': '맞춤 순서 규칙',
+  'settings.accountOrderRulesHelp':
+    '쉼표로 구분된 우선 순서 규칙(1/2/3/4 번호·라벨·ID 지원): main:1>2>3>4, model=모델:3>4>1>2, key=API키:2>1>3>4 또는 X-AIStudio-Account-Order 헤더로 지정',
   'settings.accountOrderUp': '{account} 위로 이동',
   'settings.accountOrderDown': '{account} 아래로 이동',
   'settings.routingFillFirst': '같은 계정 우선',

@@ -64,7 +64,7 @@ func (s *server) handleInteraction(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if previous.Upstream != "" && previous.Agent == generate.Model {
-			if requested := requestedAccount(r); requested != "" && requested != previous.AccountID {
+			if requested := requestedAccount(r); requested != "" && !accountMatchesRequested(s.service, previous.AccountID, requested) {
 				writeGeminiError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "previous_interaction_id was created by a different account than X-AIStudio-Account")
 				return
 			}

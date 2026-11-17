@@ -423,6 +423,7 @@ export interface ServiceConfig {
   max_account_switches: number
   routing_strategy: 'round-robin' | 'fill-first'
   account_order: string
+  account_order_rules?: string | null
   upstream_channels: UpstreamChannel[]
   model_mapping: string
   model_channels: string

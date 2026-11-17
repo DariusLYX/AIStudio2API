@@ -18,17 +18,52 @@ function label(id: string): string {
   return props.accounts.find((account) => account.id === id)?.label ?? id
 }
 
+// sortedAccounts 是按稳定 ID 升序排列的账户基准列表（对应 1/2/3/4 与 #1/#2 序号）
+const sortedAccounts = computed(() =>
+  [...props.accounts].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)),
+)
+
+// resolveToken 将单个账户简写（精确 ID、#N、唯一标签、数字序号）解析为账户 ID，无法解析（如 @规则名）时返回 null
+function resolveToken(raw: string): string | null {
+  const token = raw.trim()
+  if (!token || token.startsWith('@')) return null
+  const exact = props.accounts.find((a) => a.id === token)
+  if (exact) return exact.id
+  const base = sortedAccounts.value
+  if (token.startsWith('#')) {
+    const idx = Number(token.slice(1).trim())
+    return Number.isInteger(idx) && idx >= 1 && idx <= base.length ? base[idx - 1]!.id : null
+  }
+  const ci = base.find((a) => a.id.toLowerCase() === token.toLowerCase())
+  if (ci) return ci.id
+  const byLabel = base.filter((a) => a.label.trim().toLowerCase() === token.toLowerCase())
+  if (byLabel.length === 1) return byLabel[0]!.id
+  const num = Number(token)
+  if (Number.isInteger(num) && num >= 1 && num <= base.length) return base[num - 1]!.id
+  return null
+}
+
+const rawTokens = computed(() =>
+  props.value
+    .split(/[,|>/\s]+/)
+    .map((s) => s.trim())
+    .filter(Boolean),
+)
+
+// isCustomExpression 表示当前值包含命名规则引用（如 @rev）等无法映射为静态账户列表的表达式，此时展示文本框防止误清空
+const isCustomExpression = computed(() =>
+  rawTokens.value.some((token) => resolveToken(token) === null),
+)
+
 // priority 是配置中列出且仍然存在的优先账户，按配置顺序
 const priority = computed(() => {
-  const ids = new Set(props.accounts.map((account) => account.id))
-  return [
-    ...new Set(
-      props.value
-        .split(',')
-        .map((id) => id.trim())
-        .filter((id) => ids.has(id)),
-    ),
-  ]
+  if (isCustomExpression.value) return []
+  const resolved: string[] = []
+  for (const token of rawTokens.value) {
+    const id = resolveToken(token)
+    if (id && !resolved.includes(id)) resolved.push(id)
+  }
+  return resolved
 })
 
 // rest 是未列出的账户数，这些账户按 ID 排在优先账户之后
@@ -69,6 +104,14 @@ function endDrag(): void {
 
 <template>
   <div class="space-y-2">
+    <input
+      v-if="isCustomExpression"
+      :value="value"
+      type="text"
+      class="w-full rounded-md border border-line bg-canvas px-3 py-2 text-sm text-white"
+      @input="emit('change', ($event.target as HTMLInputElement).value)"
+    />
+    <template v-else>
     <ol v-if="priority.length > 0" aria-labelledby="setting-account-order-label">
       <li
         v-for="(id, index) in priority"
@@ -143,5 +186,6 @@ function endDrag(): void {
           : t('settings.accountOrderRest').replace('{count}', String(rest))
       }}</span>
     </div>
+    </template>
   </div>
 </template>

@@ -697,6 +697,20 @@ func (manager *runtimeManager) RecordAccessLog(entry api.AccessLog) {
 	}
 }
 
+// AccountMatchesRequest 判断账户 ID 是否匹配请求头 X-AIStudio-Account
+func (manager *runtimeManager) AccountMatchesRequest(accountID string, requested string) bool {
+	manager.mu.RLock()
+	defer manager.mu.RUnlock()
+	if manager.current != nil {
+		if matcher, ok := manager.current.service.(interface {
+			AccountMatchesRequest(string, string) bool
+		}); ok {
+			return matcher.AccountMatchesRequest(accountID, requested)
+		}
+	}
+	return accountID == requested
+}
+
 // decorateRuntimeConfig 标记配置所属的进程级与生成服务生效时机
 func (manager *runtimeManager) decorateRuntimeConfig(value api.RuntimeConfig, active config.Config) api.RuntimeConfig {
 	value.ActiveListenAddr = manager.activeManagement.ListenAddr

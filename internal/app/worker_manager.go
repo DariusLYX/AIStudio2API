@@ -317,7 +317,7 @@ func (manager *accountWorkerManager) markStartupFailed(account *accountWorker, c
 	return wrapped
 }
 
-// runtimeAvailable 过滤仍在占用或冷启动失败退避期内的账户，并返回其中一个退避原因
+// runtimeAvailable 过滤仍在其他进程占用退避期内的账户，并返回其中一个占用原因
 func (manager *accountWorkerManager) runtimeAvailable(accountIDs []string) ([]string, error) {
 	now := time.Now()
 	available := make([]string, 0, len(accountIDs))
@@ -332,18 +332,51 @@ func (manager *accountWorkerManager) runtimeAvailable(accountIDs []string) ([]st
 		}
 		account.mu.Lock()
 		busy := now.Before(account.busyUntil)
-		startupCooling := now.Before(account.startupUntil)
 		if busy && busyErr == nil {
 			busyErr = account.busyErr
-		} else if startupCooling && busyErr == nil {
-			busyErr = account.startupErr
 		}
 		account.mu.Unlock()
-		if !busy && !startupCooling {
+		if !busy {
 			available = append(available, accountID)
 		}
 	}
 	return available, busyErr
+}
+
+// filterStartupCooling 过滤处于冷启动失败退避窗口内的待命账户；若没有其他非退避候选可用（如单号部署或代理恢复后全部候选均处于退避中），则保留退避最早到期的账户以立即重试，避免全员空转报错
+func (manager *accountWorkerManager) filterStartupCooling(accountIDs []string, hasOtherCandidates bool) []string {
+	if len(accountIDs) == 0 {
+		return nil
+	}
+	now := time.Now()
+	ready := make([]string, 0, len(accountIDs))
+	var earliestID string
+	var earliestUntil time.Time
+	for _, accountID := range accountIDs {
+		manager.mu.RLock()
+		account := manager.accounts[accountID]
+		manager.mu.RUnlock()
+		if account == nil {
+			ready = append(ready, accountID)
+			continue
+		}
+		account.mu.Lock()
+		until := account.startupUntil
+		cooling := now.Before(until)
+		account.mu.Unlock()
+		if !cooling {
+			ready = append(ready, accountID)
+			continue
+		}
+		if earliestID == "" || until.Before(earliestUntil) {
+			earliestID = accountID
+			earliestUntil = until
+		}
+	}
+	if len(ready) > 0 || hasOtherCandidates || earliestID == "" {
+		return ready
+	}
+	return []string{earliestID}
 }
 
 // workerIdleTimeout 为超出热池目标的 Worker 空闲多久后关闭
@@ -462,6 +495,9 @@ func (manager *accountWorkerManager) Reset(accountID string) error {
 	defer account.startupMu.Unlock()
 	account.mu.Lock()
 	defer account.mu.Unlock()
+	account.startupDelay = 0
+	account.startupUntil = time.Time{}
+	account.startupErr = nil
 	return manager.stopAccountWorker(account)
 }
 
@@ -1158,8 +1194,10 @@ func (manager *accountWorkerManager) startReservedWorker(
 				"page_model", bootstrapModel, "duration", time.Since(startedAt))
 			return nil, err
 		}
-		if manager.refresher != nil && !reload && aistudio.DefinitiveAuthenticationFailure(initErr) {
-			manager.requests.logStage(label, "INFO", api.LogStage{Name: "WAA Worker 启动"}, "登录态失效，账户认证续签", "error", initErr)
+		if aistudio.DefinitiveAuthenticationFailure(initErr) {
+			if manager.refresher != nil && !reload {
+				manager.requests.logStage(label, "INFO", api.LogStage{Name: "WAA Worker 启动"}, "登录态失效，账户认证续签", "error", initErr)
+			}
 			return nil, &accountWorkerInitError{err: initErr, proxy: options.Proxy}
 		}
 		manager.requests.logStage(label, "ERROR", api.LogStage{Name: "WAA Worker 启动", State: "failed"}, "WAA Worker 启动失败",

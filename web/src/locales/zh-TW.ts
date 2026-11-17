@@ -428,6 +428,9 @@ export const messages: Record<TranslationKey, string> = {
   'settings.routingRoundRobin': '輪流分配',
   'settings.accountOrder': '帳號順序',
   'settings.accountOrderHelp': '優先使用同一帳號時依序使用這些帳號，滿載、冷卻或無法使用時換下一個',
+  'settings.accountOrderRules': '自訂順序規則',
+  'settings.accountOrderRulesHelp':
+    '多套順序規則（逗號分隔），支援命名預設如 main:1>2>3>4, rev:4>3>2>1（可於 ACCOUNT_ORDER、同名模型別名或標頭 X-AIStudio-Account-Order 引用），以及 model=模型:3>4>1>2、key=金鑰:2>1>3>4',
   'settings.accountOrderUp': '上移 {account}',
   'settings.accountOrderDown': '下移 {account}',
   'settings.routingFillFirst': '優先使用同一帳號',

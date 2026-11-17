@@ -7,6 +7,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	appconfig "github.com/Mag1cFall/AIStudio2API/internal/config"
 )
 
 // Channel 表示生成请求的上游额度来源
@@ -60,15 +62,11 @@ func (p *AccountPool) SetModelAccounts(accounts map[string][]string) {
 	p.notifyLocked()
 }
 
-// SetAccountOrder 设置 fill-first 依次使用的账户 ID
-func (p *AccountPool) SetAccountOrder(accountIDs []string) {
-	order := make(map[string]int, len(accountIDs))
-	for rank, accountID := range accountIDs {
-		order[accountID] = rank
-	}
+// SetAccountOrder 设置 fill-first 默认依次使用的账户引用或规则名
+func (p *AccountPool) SetAccountOrder(accountTokens []string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.accountOrder = order
+	p.accountOrderTokens = slices.Clone(accountTokens)
 	p.notifyLocked()
 }
 
@@ -94,13 +92,19 @@ func contextAccount(ctx context.Context) string {
 	return accountID
 }
 
-// ContextWithSelectionScope 返回带有 source 中所用 API key 与指定账户的 ctx，供跨请求的操作沿用发起请求的选号范围
+// ContextWithSelectionScope 返回带有 source 中所用 API key、指定账户、顺序覆盖与模型别名的 ctx，供跨请求的操作沿用发起请求的选号范围
 func ContextWithSelectionScope(ctx, source context.Context) context.Context {
 	if key, ok := source.Value(apiKeyContextKey{}).(string); ok {
 		ctx = ContextWithAPIKey(ctx, key)
 	}
 	if accountID := contextAccount(source); accountID != "" {
 		ctx = ContextWithAccount(ctx, accountID)
+	}
+	if order := contextAccountOrder(source); order != "" {
+		ctx = ContextWithAccountOrder(ctx, order)
+	}
+	if alias := contextModelAlias(source); alias != "" {
+		ctx = ContextWithModelAlias(ctx, alias)
 	}
 	return ctx
 }
@@ -113,21 +117,54 @@ func (p *AccountPool) SetAPIKeyAccounts(accounts map[string][]string) {
 	p.notifyLocked()
 }
 
-// scopedSelection 把请求指定的账户、所用 API key 与模型绑定的账户并入选择，指定账户与绑定资源的选择不受模型绑定限制
+// scopedSelection 把请求指定的账户、顺序规则、所用 API key 与模型绑定的账户并入选择，指定账户与绑定资源的选择不受模型绑定限制
 func (p *AccountPool) scopedSelection(ctx context.Context, selection AccountSelection) AccountSelection {
-	if selection.AccountID == "" {
-		selection.AccountID = contextAccount(ctx)
-	}
 	key, _ := ctx.Value(apiKeyContextKey{}).(string)
-	p.mu.Lock()
-	keyScope, keyBound := p.apiKeyAccounts[key]
-	modelScope, modelBound := p.modelAccounts[strings.TrimPrefix(strings.TrimSpace(selection.ModelID), "models/")]
-	p.mu.Unlock()
-	if keyBound {
-		selection.AllowedAccountIDs = narrowedAccounts(selection.AllowedAccountIDs, keyScope)
+	if selection.apiKey == "" {
+		selection.apiKey = key
 	}
-	if modelBound && selection.AccountID == "" && selection.ResourceID == "" {
-		selection.AllowedAccountIDs = narrowedAccounts(selection.AllowedAccountIDs, modelScope)
+	if selection.OrderOverride == "" {
+		selection.OrderOverride = contextAccountOrder(ctx)
+	}
+	if selection.ModelAlias == "" {
+		selection.ModelAlias = contextModelAlias(ctx)
+	}
+	requestedAcc := selection.AccountID
+	if requestedAcc == "" {
+		requestedAcc = contextAccount(ctx)
+	}
+	modelID := strings.TrimPrefix(strings.TrimSpace(selection.ModelID), "models/")
+	p.mu.Lock()
+	base := p.baseOrderedAccountsLocked()
+	var resolvedKeyScope, resolvedModelScope, headerMultiScope []string
+	if rawKeyScope, ok := p.apiKeyAccounts[selection.apiKey]; ok {
+		resolvedKeyScope = p.resolveScopeTokensLocked(rawKeyScope, base, false)
+	}
+	if rawModelScope, ok := p.modelAccounts[modelID]; ok {
+		resolvedModelScope = p.resolveScopeTokensLocked(rawModelScope, base, false)
+	}
+	if requestedAcc != "" {
+		if isMultiAccountHeader(requestedAcc) {
+			headerMultiScope = p.resolveScopeTokensLocked(appconfig.ParseAccountOrderTokens(requestedAcc), base, true)
+			selection.AccountID = ""
+			if selection.OrderOverride == "" {
+				selection.OrderOverride = requestedAcc
+			}
+		} else if resolvedID, ok := p.resolveAccountRefLocked(requestedAcc, base, true); ok {
+			selection.AccountID = resolvedID
+		} else {
+			selection.AccountID = requestedAcc
+		}
+	}
+	p.mu.Unlock()
+	if headerMultiScope != nil {
+		selection.AllowedAccountIDs = narrowedAccounts(selection.AllowedAccountIDs, headerMultiScope)
+	}
+	if resolvedKeyScope != nil {
+		selection.AllowedAccountIDs = narrowedAccounts(selection.AllowedAccountIDs, resolvedKeyScope)
+	}
+	if resolvedModelScope != nil && selection.AccountID == "" && selection.ResourceID == "" && headerMultiScope == nil {
+		selection.AllowedAccountIDs = narrowedAccounts(selection.AllowedAccountIDs, resolvedModelScope)
 	}
 	return selection
 }

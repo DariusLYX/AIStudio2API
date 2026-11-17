@@ -445,6 +445,9 @@ export const messages: Record<TranslationKey, string> = {
   'settings.accountOrder': 'Kontoreihenfolge',
   'settings.accountOrderHelp':
     'Beim Bevorzugen desselben Kontos werden diese Konten der Reihe nach verwendet; ist ein Konto ausgelastet, in der Abklingzeit oder nicht verfügbar, folgt das nächste',
+  'settings.accountOrderRules': 'Benutzerdefinierte Reihenfolgeregeln',
+  'settings.accountOrderRulesHelp':
+    'Kommagetrennte Regeln (1/2/3/4-Index, Label oder ID): main:1>2>3>4, model=Modell:3>4>1>2, key=Schlüssel:2>1>3>4 oder per Header X-AIStudio-Account-Order',
   'settings.accountOrderUp': '{account} nach oben',
   'settings.accountOrderDown': '{account} nach unten',
   'settings.routingFillFirst': 'Gleiches Konto bevorzugen',

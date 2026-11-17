@@ -521,11 +521,29 @@ func requestedAccount(r *http.Request) string {
 	return strings.TrimSpace(r.Header.Get("X-AIStudio-Account"))
 }
 
-// accountContextMiddleware 把 X-AIStudio-Account 请求头指定的账户放进请求上下文，账户池只用该账户
+// accountMatchesRequested 判断创建资源的账户是否匹配请求头 X-AIStudio-Account（支持简写与多号列表）
+func accountMatchesRequested(service aistudio.Service, accountID string, requested string) bool {
+	if matcher, ok := service.(interface {
+		AccountMatchesRequest(string, string) bool
+	}); ok {
+		return matcher.AccountMatchesRequest(accountID, requested)
+	}
+	return accountID == requested
+}
+
+// requestedAccountOrder 返回 X-AIStudio-Account-Order 请求头指定的账户耗尽顺序或规则名
+func requestedAccountOrder(r *http.Request) string {
+	return strings.TrimSpace(r.Header.Get("X-AIStudio-Account-Order"))
+}
+
+// accountContextMiddleware 把 X-AIStudio-Account 与 X-AIStudio-Account-Order 请求头放进请求上下文
 func accountContextMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if accountID := requestedAccount(r); accountID != "" {
 			r = r.WithContext(aistudio.ContextWithAccount(r.Context(), accountID))
+		}
+		if order := requestedAccountOrder(r); order != "" {
+			r = r.WithContext(aistudio.ContextWithAccountOrder(r.Context(), order))
 		}
 		next.ServeHTTP(w, r)
 	})

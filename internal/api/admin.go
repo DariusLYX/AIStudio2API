@@ -324,6 +324,7 @@ type RuntimeConfig struct {
 	PerAccountConcurrency     int                  `json:"per_account_concurrency"`
 	RoutingStrategy           string               `json:"routing_strategy"`
 	AccountOrder              string               `json:"account_order"`
+	AccountOrderRules         *string              `json:"account_order_rules"`
 	MaxAccountSwitches        int                  `json:"max_account_switches"`
 	UpstreamChannels          []string             `json:"upstream_channels"`
 	ModelMapping              string               `json:"model_mapping"`

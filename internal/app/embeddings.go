@@ -11,7 +11,7 @@ import (
 
 // Embed 跟踪 Build 通道 embedding 使用的账户、通道与输入 token
 func (service *trackedService) Embed(ctx context.Context, request aistudio.EmbeddingRequest) (aistudio.EmbeddingResult, error) {
-	request.Model = service.mappedModel(request.Model)
+	ctx, request.Model = service.resolveRequestedModel(ctx, request.Model)
 	api.SetAccessLogTarget(ctx, request.Model, "")
 	api.StartAccessLog(ctx)
 	request.Model = service.catalogModelID(ctx, request.Model)
@@ -68,18 +68,19 @@ func (service *trackedService) Embed(ctx context.Context, request aistudio.Embed
 
 // embeddingCandidates 按已有 Worker 优先的顺序列出 Build 通道支持 embedding 模型的账户
 func (service *trackedService) embeddingCandidates(ctx context.Context, modelID string) ([]string, error) {
+	selection := aistudio.AccountSelection{ModelID: modelID, Method: "embedContent"}
 	groups, err := service.pool.ClassifyCandidates(
-		ctx, aistudio.AccountSelection{ModelID: modelID, Method: "embedContent"}, service.workers.WarmAccountIDs(),
+		ctx, selection, service.workers.WarmAccountIDs(),
 	)
 	if err != nil {
 		return nil, err
 	}
 	standbyReady, readyBusyErr := service.workers.runtimeAvailable(groups.StandbyReady)
 	standbyBusy, standbyBusyErr := service.workers.runtimeAvailable(groups.StandbyBusy)
-	candidates := service.pool.OrderCandidates(append(append([]string(nil), groups.WarmReady...), groups.WarmAvailable...), modelID)
-	candidates = append(candidates, service.pool.OrderCandidates(standbyReady, modelID)...)
-	candidates = append(candidates, service.pool.OrderCandidates(groups.WarmBusy, modelID)...)
-	candidates = append(candidates, service.pool.OrderCandidates(standbyBusy, modelID)...)
+	candidates := service.pool.OrderSelectionCandidates(ctx, selection, append(append([]string(nil), groups.WarmReady...), groups.WarmAvailable...))
+	candidates = append(candidates, service.pool.OrderSelectionCandidates(ctx, selection, standbyReady)...)
+	candidates = append(candidates, service.pool.OrderSelectionCandidates(ctx, selection, groups.WarmBusy)...)
+	candidates = append(candidates, service.pool.OrderSelectionCandidates(ctx, selection, standbyBusy)...)
 	if len(candidates) == 0 {
 		if !groups.EarliestCooldown.Until.IsZero() {
 			return nil, &aistudio.AllCoolingError{ModelID: modelID, Until: groups.EarliestCooldown.Until, Reason: groups.EarliestCooldown.Reason}

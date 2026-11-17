@@ -446,6 +446,9 @@ export const messages: Record<TranslationKey, string> = {
   'settings.accountOrder': 'アカウントの順序',
   'settings.accountOrderHelp':
     '同じアカウントを優先する場合、この順序で使用し、上限到達・クールダウン中・利用不可のときは次のアカウントに切り替えます',
+  'settings.accountOrderRules': 'カスタム順序ルール',
+  'settings.accountOrderRulesHelp':
+    'カンマ区切りの優先順序ルール（1/2/3/4 番号・ラベル・ID 対応）：main:1>2>3>4、model=モデル:3>4>1>2、key=APIキー:2>1>3>4、または X-AIStudio-Account-Order ヘッダーで指定',
   'settings.accountOrderUp': '{account} を上へ移動',
   'settings.accountOrderDown': '{account} を下へ移動',
   'settings.routingFillFirst': '同じアカウントを優先',

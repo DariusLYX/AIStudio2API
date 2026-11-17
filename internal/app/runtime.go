@@ -66,6 +66,7 @@ func newRuntime(
 	pool := aistudio.NewAccountPool(accounts, cfg.PerAccountConcurrency)
 	pool.SetRoutingStrategy(cfg.RoutingStrategy)
 	pool.SetAccountOrder(accountOrder(cfg.AccountOrder))
+	pool.SetAccountOrderRules(accountOrderRules(cfg.AccountOrderRules))
 	pool.SetUpstreamChannels(upstreamChannels(cfg.UpstreamChannels))
 	pool.SetModelChannels(modelChannels(cfg.ModelChannels))
 	pool.SetModelAccounts(modelAccounts(cfg.ModelAccounts))
@@ -662,6 +663,19 @@ func (service *trackedService) withAliases(models []aistudio.Model) []aistudio.M
 	return models
 }
 
+// AccountMatchesRequest 判断账户 ID 是否匹配请求头 X-AIStudio-Account
+func (service *trackedService) AccountMatchesRequest(accountID string, requested string) bool {
+	return service.pool.AccountMatchesRequest(accountID, requested)
+}
+
+// resolveRequestedModel 将客户端原始请求的模型名写入上下文（供定制顺序规则按模型别名匹配），并返回 MODEL_MAPPING 转换后的目标模型名
+func (service *trackedService) resolveRequestedModel(ctx context.Context, requested string) (context.Context, string) {
+	if strings.TrimSpace(requested) != "" {
+		ctx = aistudio.ContextWithModelAlias(ctx, requested)
+	}
+	return ctx, service.mappedModel(requested)
+}
+
 // mappedModel 返回 MODEL_MAPPING 中别名映射到的模型名，别名带思考后缀时该后缀替换目标自带的后缀，不是别名时原样返回
 func (service *trackedService) mappedModel(name string) string {
 	trimmed := strings.TrimPrefix(strings.TrimSpace(name), "models/")
@@ -1252,7 +1266,8 @@ func (service *trackedService) observedDataRequestContext(
 
 // CountTokens 返回上游权威输入 token 数
 func (service *trackedService) CountTokens(ctx context.Context, request aistudio.TokenCountRequest) (aistudio.TokenCount, error) {
-	model, _, err := aistudio.ApplyModelSuffix(service.mappedModel(request.Model), aistudio.GenerationConfig{})
+	ctx, mapped := service.resolveRequestedModel(ctx, request.Model)
+	model, _, err := aistudio.ApplyModelSuffix(mapped, aistudio.GenerationConfig{})
 	if err != nil {
 		return aistudio.TokenCount{}, err
 	}
@@ -1269,7 +1284,9 @@ func (service *trackedService) CountTokens(ctx context.Context, request aistudio
 
 // GenerateTitle 生成试用页页头标题
 func (service *trackedService) GenerateTitle(ctx context.Context, request aistudio.TitleRequest) (string, error) {
-	request.Model = service.catalogModelID(ctx, service.mappedModel(request.Model))
+	var mapped string
+	ctx, mapped = service.resolveRequestedModel(ctx, request.Model)
+	request.Model = service.catalogModelID(ctx, mapped)
 	requestCtx, cancel, err := service.dataRequestContext(ctx)
 	if err != nil {
 		return "", err
@@ -1280,7 +1297,9 @@ func (service *trackedService) GenerateTitle(ctx context.Context, request aistud
 
 // GenerateImage 生成 Imagen 图片并登记请求目标与账户
 func (service *trackedService) GenerateImage(ctx context.Context, request aistudio.ImageRequest) ([]aistudio.GeneratedImage, error) {
-	request.Model = service.catalogModelID(ctx, service.mappedModel(request.Model))
+	var mapped string
+	ctx, mapped = service.resolveRequestedModel(ctx, request.Model)
+	request.Model = service.catalogModelID(ctx, mapped)
 	requestCtx, cancel, err := service.observedDataRequestContext(ctx, request.Model)
 	if err != nil {
 		return nil, err
@@ -1293,7 +1312,9 @@ func (service *trackedService) GenerateImage(ctx context.Context, request aistud
 
 // CreateDecision 回答决策问题并登记请求目标与账户，每次请求在运行日志中提醒该模型在 AI Studio 官网中隐藏
 func (service *trackedService) CreateDecision(ctx context.Context, request aistudio.DecisionRequest) (aistudio.DecisionResult, error) {
-	request.Model = service.catalogModelID(ctx, service.mappedModel(request.Model))
+	var mapped string
+	ctx, mapped = service.resolveRequestedModel(ctx, request.Model)
+	request.Model = service.catalogModelID(ctx, mapped)
 	requestCtx, cancel, err := service.observedDataRequestContext(ctx, request.Model)
 	if err != nil {
 		return aistudio.DecisionResult{}, err
@@ -1307,7 +1328,7 @@ func (service *trackedService) CreateDecision(ctx context.Context, request aistu
 
 // GenerateVideo 创建一个视频长任务
 func (service *trackedService) GenerateVideo(ctx context.Context, request aistudio.VideoRequest) (aistudio.VideoOperation, error) {
-	request.Model = service.mappedModel(request.Model)
+	ctx, request.Model = service.resolveRequestedModel(ctx, request.Model)
 	api.SetAccessLogTarget(ctx, request.Model, "")
 	request.Model = service.catalogModelID(ctx, request.Model)
 	requestCtx, cancel, err := service.dataRequestContext(ctx)
@@ -1457,7 +1478,7 @@ func (service *trackedService) acquireWarmLease(ctx context.Context, selection a
 	failedWorkers := make(map[string]struct{})
 	var promoteFailure error
 	dispatch := service.workers.dispatch
-	waiter := dispatch.join(dispatchKey(selection))
+	waiter := dispatch.join(dispatchKey(service.pool.SelectionOrderSignature(ctx, selection), selection))
 	defer dispatch.leave(waiter)
 	wait := func(delay time.Duration) error {
 		return waitScheduling(ctx, waiter.wake, delay)
@@ -1487,8 +1508,19 @@ func (service *trackedService) acquireWarmLease(ctx context.Context, selection a
 		groups.StandbyReady, readyBusyErr = service.workers.runtimeAvailable(groups.StandbyReady)
 		groups.StandbyBusy, standbyBusyErr = service.workers.runtimeAvailable(groups.StandbyBusy)
 		runtimeBusyErr := errors.Join(readyBusyErr, standbyBusyErr)
+		hasWarm := len(groups.WarmReady)+len(groups.WarmAvailable)+len(groups.WarmBusy) > 0
+		readyFiltered := service.workers.filterStartupCooling(groups.StandbyReady, true)
+		busyFiltered := service.workers.filterStartupCooling(groups.StandbyBusy, true)
+		if !hasWarm && len(readyFiltered) == 0 && len(busyFiltered) == 0 {
+			if len(groups.StandbyReady) > 0 {
+				readyFiltered = service.workers.filterStartupCooling(groups.StandbyReady, false)
+			} else {
+				busyFiltered = service.workers.filterStartupCooling(groups.StandbyBusy, false)
+			}
+		}
+		groups.StandbyReady, groups.StandbyBusy = readyFiltered, busyFiltered
 		if service.pool.RoutingStrategy() == "fill-first" {
-			groups = service.restrictFillFirstGroups(groups, selection, active)
+			groups = service.restrictFillFirstGroups(ctx, groups, selection, active)
 		}
 		candidates := len(groups.WarmReady) + len(groups.WarmAvailable) + len(groups.WarmBusy) +
 			len(groups.StandbyReady) + len(groups.StandbyBusy)
@@ -1625,6 +1657,7 @@ func (service *trackedService) acquireWarmLease(ctx context.Context, selection a
 // restrictFillFirstGroups 在 fill-first 策略下将已排除启动失败与进程占用的候选账户收敛为顺位第 1 个可用账户；
 // 若 PreferredAccountID 在已活跃的 Worker 中（如原页多轮续聊或持有已上传的内联图片），优先保持在该账户跑完当前对话，新对话则严格回到顺位首号。
 func (service *trackedService) restrictFillFirstGroups(
+	ctx context.Context,
 	groups aistudio.AccountCandidateGroups,
 	selection aistudio.AccountSelection,
 	activeWarm []string,
@@ -1633,7 +1666,7 @@ func (service *trackedService) restrictFillFirstGroups(
 	if len(surviving) <= 1 {
 		return groups
 	}
-	ordered := service.pool.OrderCandidates(surviving, selection.ModelAccessScope)
+	ordered := service.pool.OrderSelectionCandidates(ctx, selection, surviving)
 	if len(ordered) == 0 {
 		return groups
 	}
@@ -1837,7 +1870,9 @@ func inlineMediaInput(contents []aistudio.Content) (int, int64) {
 // Generate 获取唯一账户并转发规范事件流
 func (service *trackedService) Generate(ctx context.Context, request aistudio.GenerateRequest) (<-chan aistudio.Event, error) {
 	generationStartedAt := time.Now()
-	model, config, suffixErr := aistudio.ApplyModelSuffix(service.mappedModel(request.Model), request.Config)
+	var mapped string
+	ctx, mapped = service.resolveRequestedModel(ctx, request.Model)
+	model, config, suffixErr := aistudio.ApplyModelSuffix(mapped, request.Config)
 	request.Model, request.Config = model, config
 	api.SetAccessLogTarget(ctx, request.Model, "")
 	api.SetAccessLogGenerationConfig(ctx, request.Config)

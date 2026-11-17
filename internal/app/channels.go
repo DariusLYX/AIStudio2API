@@ -2,8 +2,6 @@ package app
 
 import (
 	"slices"
-	"strings"
-	"unicode"
 
 	"github.com/Mag1cFall/AIStudio2API/internal/aistudio"
 	"github.com/Mag1cFall/AIStudio2API/internal/config"
@@ -34,9 +32,15 @@ func modelAccounts(value string) map[string][]string {
 	return accounts
 }
 
-// accountOrder 把 ACCOUNT_ORDER 拆成依次排列的账户 ID
+// accountOrder 把 ACCOUNT_ORDER 拆成依次排列的账户引用或规则名
 func accountOrder(value string) []string {
-	return strings.FieldsFunc(value, func(char rune) bool { return char == ',' || unicode.IsSpace(char) })
+	return config.ParseAccountOrderTokens(value)
+}
+
+// accountOrderRules 解析 ACCOUNT_ORDER_RULES 为多套定制账户顺序规则
+func accountOrderRules(value string) []config.AccountOrderRule {
+	rules, _ := config.ParseAccountOrderRules(value)
+	return rules
 }
 
 // apiKeyAccounts 解析 API_KEY_ACCOUNTS 为各 API key 可用的账户 ID；active 是管理服务启动时的配置，已从 keys 中移除而管理服务仍接受的 key 沿用 active 中的绑定

@@ -448,6 +448,9 @@ export const messages: Record<TranslationKey, string> = {
   'settings.accountOrder': 'Ordre des comptes',
   'settings.accountOrderHelp':
     'Avec « Même compte en priorité », ces comptes sont utilisés dans cet ordre ; le compte suivant prend le relais lorsqu’un compte est saturé, en temporisation ou indisponible',
+  'settings.accountOrderRules': 'Règles d’ordre personnalisées',
+  'settings.accountOrderRulesHelp':
+    'Règles séparées par des virgules (indices 1/2/3/4, libellés ou ID) : main:1>2>3>4, model=modèle:3>4>1>2, key=clé:2>1>3>4 ou via l’en-tête X-AIStudio-Account-Order',
   'settings.accountOrderUp': 'Monter {account}',
   'settings.accountOrderDown': 'Descendre {account}',
   'settings.routingFillFirst': 'Même compte en priorité',

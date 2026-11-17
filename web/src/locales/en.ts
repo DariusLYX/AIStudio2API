@@ -442,6 +442,9 @@ export const messages: Record<TranslationKey, string> = {
   'settings.accountOrder': 'Account order',
   'settings.accountOrderHelp':
     'Fill first uses these accounts in order and moves to the next one when an account is full, cooling down, or unavailable',
+  'settings.accountOrderRules': 'Custom order rules',
+  'settings.accountOrderRulesHelp':
+    'Comma-separated priority rules using 1/2/3/4 indices, labels, or IDs: named presets like main:1>2>3>4, rev:4>3>2>1 (referenced via ACCOUNT_ORDER, model aliases, or X-AIStudio-Account-Order), model=pattern:3>4>1>2, or key=apiKey:2>1>3>4',
   'settings.accountOrderUp': 'Move {account} up',
   'settings.accountOrderDown': 'Move {account} down',
   'settings.routingFillFirst': 'Fill first',

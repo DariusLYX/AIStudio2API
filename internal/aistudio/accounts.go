@@ -10,7 +10,6 @@ import (
 	"io"
 	"log/slog"
 	"maps"
-	"math"
 	"net/http"
 	"net/mail"
 	"os"
@@ -396,13 +395,18 @@ type AccountSelection struct {
 	AllowedAccountIDs []string
 	// PreferredAccountID 是可用时先于其他账户选择的账户
 	PreferredAccountID string
-	PlaygroundOnly     bool
-	Channel            Channel
-	PreferredChannel   Channel
+	// OrderOverride 是当前请求显式指定的账户顺序或规则名覆盖
+	OrderOverride string
+	// ModelAlias 是 MODEL_MAPPING 转换前的客户端原始模型名
+	ModelAlias       string
+	PlaygroundOnly   bool
+	Channel          Channel
+	PreferredChannel Channel
 	// StickySession 表示本次请求正在续接已有页面对话或多轮内联媒体上下文，fill-first 下允许保持在已就绪的 PreferredAccountID
 	StickySession bool
 	// IgnoreQuotaCooldown 为 true 时套餐限额与每日限额冷却中的账户照常参与选号
 	IgnoreQuotaCooldown bool
+	apiKey              string
 	anyTier             bool
 	anyState            bool
 }
@@ -496,7 +500,8 @@ type AccountPool struct {
 	modelChannels         map[string]Channel
 	apiKeyAccounts        map[string][]string
 	modelAccounts         map[string][]string
-	accountOrder          map[string]int
+	accountOrderTokens    []string
+	accountOrderRules     []appconfig.AccountOrderRule
 	changed               chan struct{}
 	// sessionCheck 以官网页面的方式打开 AI Studio 检查账户会话，为空时认证失败直接标记需要重新登录
 	sessionCheck func(context.Context, *Account) error
@@ -2312,8 +2317,9 @@ func (p *AccountPool) PreferWarmPool(accountIDs []string) []string {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.routingStrategy != "round-robin" {
+		ranks := p.effectiveOrderMapLocked(AccountSelection{})
 		sort.SliceStable(result, func(left int, right int) bool {
-			return p.accountRankLocked(result[left]) < p.accountRankLocked(result[right])
+			return rankInOrderMap(ranks, result[left]) < rankInOrderMap(ranks, result[right])
 		})
 	}
 	return result
@@ -3074,18 +3080,11 @@ func (p *AccountPool) selectionIndicesLocked(selection AccountSelection) ([]int,
 		start := sort.Search(len(indices), func(index int) bool { return p.accounts[indices[index]].ID > last })
 		return append(indices[start:], indices[:start]...), nil
 	}
+	ranks := p.effectiveOrderMapLocked(selection)
 	sort.SliceStable(indices, func(left, right int) bool {
-		return p.accountRankLocked(p.accounts[indices[left]].ID) < p.accountRankLocked(p.accounts[indices[right]].ID)
+		return rankInOrderMap(ranks, p.accounts[indices[left]].ID) < rankInOrderMap(ranks, p.accounts[indices[right]].ID)
 	})
 	return indices, nil
-}
-
-// accountRankLocked 返回账户在 ACCOUNT_ORDER 中的位置，未列出的账户排在最后
-func (p *AccountPool) accountRankLocked(accountID string) int {
-	if rank, listed := p.accountOrder[accountID]; listed {
-		return rank
-	}
-	return math.MaxInt
 }
 
 // RoutingStrategy 返回当前账户选择策略
@@ -3115,21 +3114,6 @@ func (p *AccountPool) SetPerAccountConcurrency(limit int) {
 	p.perAccountConcurrency = limit
 	p.notifyLocked()
 	p.mu.Unlock()
-}
-
-// OrderCandidates 按当前策略排列候选账户而不推进轮询位置
-func (p *AccountPool) OrderCandidates(accountIDs []string, modelAccessScope string) []string {
-	if len(accountIDs) == 0 {
-		return nil
-	}
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	indices, _ := p.selectionIndicesLocked(AccountSelection{AllowedAccountIDs: accountIDs, ModelAccessScope: modelAccessScope})
-	ordered := make([]string, 0, len(indices))
-	for _, index := range indices {
-		ordered = append(ordered, p.accounts[index].ID)
-	}
-	return ordered
 }
 
 func (p *AccountPool) setAccountState(accountID string, state AccountState, reason string) error {

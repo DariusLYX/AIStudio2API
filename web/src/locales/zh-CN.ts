@@ -423,6 +423,9 @@ export const messages = {
   'settings.routingRoundRobin': '轮询',
   'settings.accountOrder': '账户顺序',
   'settings.accountOrderHelp': '账户粘性优先时依次使用这些账户，满载、冷却或不可用时换下一个',
+  'settings.accountOrderRules': '定制顺序规则',
+  'settings.accountOrderRulesHelp':
+    '多套顺序规则（逗号分隔），支持命名预设如 main:1>2>3>4, rev:4>3>2>1（可在 ACCOUNT_ORDER、同名模型别名或请求头 X-AIStudio-Account-Order 引用），以及 model=模型:3>4>1>2、key=密钥:2>1>3>4',
   'settings.accountOrderUp': '上移 {account}',
   'settings.accountOrderDown': '下移 {account}',
   'settings.routingFillFirst': '账户粘性优先',

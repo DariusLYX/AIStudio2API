@@ -1140,6 +1140,10 @@ func (admin *runtimeAdmin) UpdateRuntimeConfig(_ context.Context, value api.Runt
 	if err != nil {
 		return api.RuntimeConfig{}, invalidConfigError(fmt.Errorf("REQUEST_TIMEOUT 无效: %w", err))
 	}
+	orderRules := saved.AccountOrderRules
+	if value.AccountOrderRules != nil {
+		orderRules = strings.TrimSpace(*value.AccountOrderRules)
+	}
 	cfg := config.Config{
 		AutoStart:      value.AutoStart,
 		HideDockIcon:   value.HideDockIcon,
@@ -1157,6 +1161,7 @@ func (admin *runtimeAdmin) UpdateRuntimeConfig(_ context.Context, value api.Runt
 		PerAccountConcurrency:  value.PerAccountConcurrency,
 		RoutingStrategy:        value.RoutingStrategy,
 		AccountOrder:           strings.TrimSpace(value.AccountOrder),
+		AccountOrderRules:      orderRules,
 		MaxAccountSwitches:     value.MaxAccountSwitches,
 		UpstreamChannels:       value.UpstreamChannels,
 		ModelMapping:           strings.TrimSpace(value.ModelMapping),
@@ -1175,6 +1180,7 @@ func (admin *runtimeAdmin) UpdateRuntimeConfig(_ context.Context, value api.Runt
 	}
 	admin.pool.SetRoutingStrategy(cfg.RoutingStrategy)
 	admin.pool.SetAccountOrder(accountOrder(cfg.AccountOrder))
+	admin.pool.SetAccountOrderRules(accountOrderRules(cfg.AccountOrderRules))
 	admin.pool.SetModelChannels(modelChannels(cfg.ModelChannels))
 	admin.pool.SetModelAccounts(modelAccounts(cfg.ModelAccounts))
 	admin.requests.log("service", "INFO", "服务配置已保存")
@@ -1453,6 +1459,7 @@ func buildVersion() string {
 }
 
 func runtimeConfigDTO(cfg config.Config) api.RuntimeConfig {
+	orderRules := cfg.AccountOrderRules
 	return api.RuntimeConfig{
 		AutoStart:      cfg.AutoStart,
 		HideDockIcon:   cfg.HideDockIcon,
@@ -1473,6 +1480,7 @@ func runtimeConfigDTO(cfg config.Config) api.RuntimeConfig {
 		PerAccountConcurrency:  cfg.PerAccountConcurrency,
 		RoutingStrategy:        cfg.RoutingStrategy,
 		AccountOrder:           cfg.AccountOrder,
+		AccountOrderRules:      &orderRules,
 		MaxAccountSwitches:     cfg.MaxAccountSwitches,
 		UpstreamChannels:       cfg.UpstreamChannels,
 		ModelMapping:           cfg.ModelMapping,

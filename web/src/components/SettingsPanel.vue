@@ -78,6 +78,7 @@ const sections: {
       'per_account_concurrency',
       'routing_strategy',
       'account_order',
+      'account_order_rules',
       'max_account_switches',
     ],
   },
@@ -760,6 +761,25 @@ async function saveConfig(): Promise<void> {
                 :accounts="accounts"
                 :value="form.account_order ?? ''"
                 @change="form.account_order = $event"
+              />
+            </SettingRow>
+            <SettingRow
+              v-if="form.routing_strategy === 'fill-first' && accounts.length > 1"
+              :label="t('settings.accountOrderRules')"
+              control-id="setting-account-order-rules"
+              :description="t('settings.accountOrderRulesHelp')"
+              effect="immediate"
+              :changed="changedFields.has('account_order_rules')"
+              :env="environmentKey('account_order_rules')"
+            >
+              <input
+                id="setting-account-order-rules"
+                :value="form.account_order_rules ?? ''"
+                :class="inputClass"
+                type="text"
+                placeholder="main:1>2>3>4, rev:4>3>2>1, model=gemini-4-argon:3>4>1>2"
+                :disabled="environmentKey('account_order_rules') !== undefined"
+                @input="form.account_order_rules = ($event.target as HTMLInputElement).value"
               />
             </SettingRow>
             <SettingRow

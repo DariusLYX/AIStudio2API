@@ -151,3 +151,38 @@ func TestEnvKeepEnvironmentKeepsInvalid(t *testing.T) {
 		t.Fatalf("保存后无效记录=%v 媒体输出=%q", kept.Invalid, kept.MediaOutput)
 	}
 }
+
+// TestParseAccountOrderRules 验证多套定制顺序规则解析（命名预设、model= 通配、key= 绑定及密钥脱敏）
+func TestParseAccountOrderRules(t *testing.T) {
+	rules, err := ParseAccountOrderRules("daily:1>2>3>4, reverse:4|3|2|1; model=gemini-4-*:3>4>1>2, key=sk:prod:2>1>4>3")
+	if err != nil || len(rules) != 4 {
+		t.Fatalf("rules=%+v err=%v", rules, err)
+	}
+	if rules[0].Kind != OrderRuleNamed || rules[0].Target != "daily" || !slices.Equal(rules[0].Accounts, []string{"1", "2", "3", "4"}) {
+		t.Fatalf("rule[0]=%+v", rules[0])
+	}
+	if rules[2].Kind != OrderRuleModel || rules[2].Target != "gemini-4-*" || !slices.Equal(rules[2].Accounts, []string{"3", "4", "1", "2"}) {
+		t.Fatalf("rule[2]=%+v", rules[2])
+	}
+	if rules[3].Kind != OrderRuleAPIKey || rules[3].Target != "sk:prod" || !slices.Equal(rules[3].Accounts, []string{"2", "1", "4", "3"}) {
+		t.Fatalf("rule[3]=%+v", rules[3])
+	}
+	for _, bad := range []string{"baditem", "daily:", "key=:", "model=[bad:1>2", "daily:1>2,daily:2>1", "Daily:1>2,daily:2>1", "key=sk-secret:1>2,key=sk-secret:2>1"} {
+		if _, err := ParseAccountOrderRules(bad); err == nil {
+			t.Fatalf("expected error for %q", bad)
+		}
+	}
+	// 允许 = 两侧空白与右侧空格分隔
+	spaced, err := ParseAccountOrderRules("key = sk-ok : 3 4 1 2")
+	if err != nil || len(spaced) != 1 || spaced[0].Kind != OrderRuleAPIKey || spaced[0].Target != "sk-ok" || !slices.Equal(spaced[0].Accounts, []string{"3", "4", "1", "2"}) {
+		t.Fatalf("spaced=%+v err=%v", spaced, err)
+	}
+	// 校验失败时（含漏写 key= 裸串）不得在 Invalid 记录原值或错误原因中泄露任何原始凭据文本
+	for _, rawRule := range []string{"key=sk-top-secret:", "sk-bare-secret"} {
+		cfg, err := Load(writeTestEnv(t, "ACCOUNT_ORDER_RULES="+rawRule+"\n"))
+		if err != nil || cfg.AccountOrderRules != "" || len(cfg.Invalid) != 1 || cfg.Invalid[0].Key != "ACCOUNT_ORDER_RULES" ||
+			cfg.Invalid[0].Value != "" || strings.Contains(cfg.Invalid[0].Reason, "secret") {
+			t.Fatalf("secret leak check failed for %q: cfg=%+v invalid=%+v err=%v", rawRule, cfg.AccountOrderRules, cfg.Invalid, err)
+		}
+	}
+}

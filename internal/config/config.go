@@ -7,11 +7,13 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"path"
 	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 )
 
 const (
@@ -43,6 +45,7 @@ var configKeys = [...]string{
 	"PER_ACCOUNT_CONCURRENCY",
 	"ROUTING_STRATEGY",
 	"ACCOUNT_ORDER",
+	"ACCOUNT_ORDER_RULES",
 	"MAX_ACCOUNT_SWITCHES",
 	"UPSTREAM_CHANNELS",
 	"MODEL_MAPPING",
@@ -145,6 +148,7 @@ type Config struct {
 	PerAccountConcurrency  int
 	RoutingStrategy        string
 	AccountOrder           string
+	AccountOrderRules      string
 	MaxAccountSwitches     int
 	UpstreamChannels       []string
 	ModelMapping           string
@@ -209,7 +213,7 @@ type InvalidValue struct {
 }
 
 // secretKeys 是取值可能含凭据的配置键，无效时不记录原值
-var secretKeys = []string{"PROXY", "PROXY_API_KEY", "API_KEY_ACCOUNTS", "ADMIN_PASSWORD"}
+var secretKeys = []string{"PROXY", "PROXY_API_KEY", "API_KEY_ACCOUNTS", "ACCOUNT_ORDER_RULES", "ADMIN_PASSWORD"}
 
 // invalidValue 返回无效配置项的记录，凭据键不带原值
 func invalidValue(key, value string, err error) InvalidValue {
@@ -255,6 +259,7 @@ var configSetters = map[string]func(*Config, string) error{
 	"PROXY":                    textSetter(func(c *Config) *string { return &c.Proxy }, strings.TrimSpace),
 	"ROUTING_STRATEGY":         textSetter(func(c *Config) *string { return &c.RoutingStrategy }, strings.TrimSpace),
 	"ACCOUNT_ORDER":            textSetter(func(c *Config) *string { return &c.AccountOrder }, strings.TrimSpace),
+	"ACCOUNT_ORDER_RULES":      textSetter(func(c *Config) *string { return &c.AccountOrderRules }, strings.TrimSpace),
 	"MODEL_MAPPING":            textSetter(func(c *Config) *string { return &c.ModelMapping }, strings.TrimSpace),
 	"MODEL_CHANNELS":           textSetter(func(c *Config) *string { return &c.ModelChannels }, strings.TrimSpace),
 	"MODEL_ACCOUNTS":           textSetter(func(c *Config) *string { return &c.ModelAccounts }, strings.TrimSpace),
@@ -402,6 +407,10 @@ var configChecks = []configCheck{
 			return fmt.Errorf("ROUTING_STRATEGY 必须是 round-robin 或 fill-first")
 		}
 		return nil
+	}},
+	{[]string{"ACCOUNT_ORDER_RULES"}, func(c Config) error {
+		_, err := ParseAccountOrderRules(c.AccountOrderRules)
+		return err
 	}},
 	{[]string{"MAX_ACCOUNT_SWITCHES"}, func(c Config) error {
 		if c.MaxAccountSwitches < 0 {
@@ -625,6 +634,7 @@ func (c Config) envValues() map[string]string {
 		"PER_ACCOUNT_CONCURRENCY":  strconv.Itoa(c.PerAccountConcurrency),
 		"ROUTING_STRATEGY":         c.RoutingStrategy,
 		"ACCOUNT_ORDER":            c.AccountOrder,
+		"ACCOUNT_ORDER_RULES":      c.AccountOrderRules,
 		"MAX_ACCOUNT_SWITCHES":     strconv.Itoa(c.MaxAccountSwitches),
 		"UPSTREAM_CHANNELS":        strings.Join(c.UpstreamChannels, ","),
 		"MODEL_MAPPING":            c.ModelMapping,
@@ -789,15 +799,118 @@ func ParseModelAccounts(value string) (map[string][]string, error) {
 	return accounts, nil
 }
 
-// accountIDs 返回以 | 分隔、去掉空白的各个账户 ID
+// accountIDs 返回以 | 或 > 分隔、去掉空白的各个账户引用
 func accountIDs(value string) []string {
 	var ids []string
-	for id := range strings.SplitSeq(value, "|") {
+	for _, id := range strings.FieldsFunc(value, func(char rune) bool { return char == '|' || char == '>' }) {
 		if id = strings.TrimSpace(id); id != "" {
 			ids = append(ids, id)
 		}
 	}
 	return ids
+}
+
+// AccountOrderRuleKind 表示一条定制账户顺序规则的匹配类型
+type AccountOrderRuleKind string
+
+const (
+	// OrderRuleNamed 表示命名顺序预设（可供 ACCOUNT_ORDER / X-AIStudio-Account-Order 引用，也匹配同名模型或别名）
+	OrderRuleNamed AccountOrderRuleKind = "named"
+	// OrderRuleModel 表示 model=<模型ID或通配符> 规则
+	OrderRuleModel AccountOrderRuleKind = "model"
+	// OrderRuleAPIKey 表示 key=<API key> 规则
+	OrderRuleAPIKey AccountOrderRuleKind = "key"
+)
+
+// AccountOrderRule 表示一条定制的账户按序耗尽规则
+type AccountOrderRule struct {
+	Kind     AccountOrderRuleKind
+	Target   string
+	Accounts []string
+}
+
+// ParseAccountOrderTokens 将 ACCOUNT_ORDER 或请求头中的顺序表达式拆分为账户引用 token（支持 , | > / 或空白分隔）
+func ParseAccountOrderTokens(value string) []string {
+	var tokens []string
+	for _, token := range strings.FieldsFunc(value, func(char rune) bool {
+		return char == ',' || char == '|' || char == '>' || char == '/' || unicode.IsSpace(char)
+	}) {
+		if token = strings.TrimSpace(token); token != "" {
+			tokens = append(tokens, token)
+		}
+	}
+	return tokens
+}
+
+// ParseAccountOrderRules 解析逗号或分号分隔的定制顺序规则（<规则名|model=模型|key=密钥>:<账户1>|<账户2> 或 <账户1>><账户2>）
+func ParseAccountOrderRules(value string) ([]AccountOrderRule, error) {
+	var rules []AccountOrderRule
+	seen := make(map[string]struct{})
+	for _, raw := range strings.FieldsFunc(value, func(char rune) bool { return char == ',' || char == ';' || char == '\n' || char == '\r' }) {
+		item := strings.TrimSpace(raw)
+		if item == "" {
+			continue
+		}
+		index := strings.LastIndexByte(item, ':')
+		selector := strings.TrimSpace(item[:max(index, 0)])
+		var accounts []string
+		if index >= 0 {
+			for _, token := range strings.FieldsFunc(item[index+1:], func(char rune) bool {
+				return char == '|' || char == '>' || char == '/' || unicode.IsSpace(char)
+			}) {
+				if token = strings.TrimSpace(token); token != "" {
+					accounts = append(accounts, token)
+				}
+			}
+		}
+		prefix, rest, hasEq := strings.Cut(selector, "=")
+		lowerPrefix := strings.ToLower(strings.TrimSpace(prefix))
+		isKeyRule := hasEq && lowerPrefix == "key"
+		isModelRule := hasEq && lowerPrefix == "model"
+		if index < 0 || selector == "" || len(accounts) == 0 {
+			if isKeyRule {
+				return nil, fmt.Errorf("ACCOUNT_ORDER_RULES 的 key 规则写成 key=API key:账户>账户")
+			}
+			return nil, fmt.Errorf("ACCOUNT_ORDER_RULES 的每一项写成 规则名:账户>账户（或 model=模型:账户|账户）")
+		}
+		var rule AccountOrderRule
+		var dedupKey string
+		switch {
+		case isKeyRule:
+			target := strings.TrimSpace(rest)
+			if target == "" {
+				return nil, fmt.Errorf("ACCOUNT_ORDER_RULES 的 key 规则缺少 API key")
+			}
+			rule = AccountOrderRule{Kind: OrderRuleAPIKey, Target: target, Accounts: accounts}
+			dedupKey = string(rule.Kind) + "\x00" + rule.Target
+		case isModelRule:
+			target := strings.TrimPrefix(strings.TrimSpace(rest), "models/")
+			if target == "" {
+				return nil, fmt.Errorf("ACCOUNT_ORDER_RULES 的 model 规则缺少模型名")
+			}
+			if _, err := path.Match(strings.ToLower(target), ""); err != nil {
+				return nil, fmt.Errorf("ACCOUNT_ORDER_RULES 中模型通配符 %q 无效", target)
+			}
+			rule = AccountOrderRule{Kind: OrderRuleModel, Target: target, Accounts: accounts}
+			dedupKey = string(rule.Kind) + "\x00" + strings.ToLower(rule.Target)
+		default:
+			target := strings.TrimPrefix(strings.TrimSpace(selector), "@")
+			if target == "" {
+				return nil, fmt.Errorf("ACCOUNT_ORDER_RULES 规则名不能为空")
+			}
+			rule = AccountOrderRule{Kind: OrderRuleNamed, Target: target, Accounts: accounts}
+			dedupKey = string(rule.Kind) + "\x00" + strings.ToLower(rule.Target)
+		}
+		if _, exists := seen[dedupKey]; exists {
+			if rule.Kind == OrderRuleAPIKey {
+				return nil, fmt.Errorf("ACCOUNT_ORDER_RULES 中同一 key 重复")
+			}
+			return nil, fmt.Errorf("ACCOUNT_ORDER_RULES 中规则 %s 重复", rule.Target)
+		}
+		seen[dedupKey] = struct{}{}
+		rules = append(rules, rule)
+	}
+	return rules, nil
 }
 
 // APIKeys 返回 PROXY_API_KEY 中逗号分隔、去掉空白的各个 key

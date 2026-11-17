@@ -28,12 +28,12 @@ func newDispatchQueue() *dispatchQueue {
 }
 
 // dispatchKey 返回可互相替代的请求共用的队列键
-func dispatchKey(selection aistudio.AccountSelection) string {
+func dispatchKey(orderSignature string, selection aistudio.AccountSelection) string {
 	allowed := slices.Clone(selection.AllowedAccountIDs)
 	slices.Sort(allowed)
 	return strings.Join([]string{
 		selection.ModelID, selection.Method, selection.Capability, selection.AccountID, selection.ResourceID,
-		selection.PreferredAccountID, strings.Join(allowed, ","), strconv.FormatBool(selection.PlaygroundOnly),
+		selection.PreferredAccountID, orderSignature, strings.Join(allowed, ","), strconv.FormatBool(selection.PlaygroundOnly),
 	}, "\x00")
 }
 

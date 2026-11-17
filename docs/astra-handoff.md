@@ -13,7 +13,7 @@
 3. **支持 2~4+ 个账号严格按序耗尽（Drain-First / Waterfall）**：
    - 后台可挂 2 个、3 个、4 个或更多 Google 账号。
    - **核心调度铁律**：**永远优先死磕排在最前面的第 1 个可用账号（包含并发跑 2 个请求也在该账号的多标签页内完成），绝不因为并发或轮询去动后面的账号；只有当前账号因为额度用尽（429 进入 `cooldown`）或账号报错/受限（401/403/5xx 换号冷却）时，才顺位切到第 2 个号；第 2 个号用完再切第 3 个号、第 4 个号**。
-   - ⚠️ **给 Astra 的特别说明**：用户提到你在 Mac 本地已经帮他改过这套“尽力用完前一个号，除非额度用完或账号报错才切后面的号”的逻辑。本仓库已在 `internal/aistudio/accounts.go` 的 `classifyCandidatesLocked` 与 `tryAcquireLocked`（当 `ROUTING_STRATEGY=fill-first` 时）实装了该语义；你在 Mac 本地拉取/合并时，**请对比你本地已有的多号顺序切换改动，直接保留/融合你本地已验证稳定的账号切换与预热参数**。
+   - ⚠️ **给 Astra 的特别说明**：用户提到你在 Mac 本地已经帮他改过这套“尽力用完前一个号，除非额度用完或账号报错才切后面的号”的逻辑。本仓库已在 `internal/app/runtime.go` 的 `restrictFillFirstGroups`、`internal/aistudio/accounts.go` 的 `tryAcquireLocked` 与 `internal/aistudio/account_order.go` 的 `ACCOUNT_ORDER_RULES` 多规则引擎中实装了该语义；你在 Mac 本地拉取/合并时，**请对比你本地已有的多号顺序切换改动，直接保留/融合你本地已验证稳定的账号切换与预热参数**。
 4. **严禁误触 Build 通道**：
    - 只走官网 `playground` 通道，禁用注入 `ask_question` 提示词的 `build` 通道（`BUILD_NATIVE_NONSTREAM=false`）。
 
@@ -42,8 +42,14 @@ PER_ACCOUNT_CONCURRENCY=2
 # 严格按序耗尽策略：优先死磕第 1 个号，除非额度用完或报错才切第 2、3、4 个号
 ROUTING_STRATEGY=fill-first
 
-# 可选：显式指定 1、2、3、4 号的使用先后顺序（留空则按邮箱字母序依次耗尽）
-# ACCOUNT_ORDER=first@gmail.com,second@gmail.com,third@gmail.com,fourth@gmail.com
+# 可选：默认账号耗尽顺序（1/2/3/4 为按账户 ID 字典序排列的第 1~4 个号，也支持 #1/#2、唯一账户标签 Label、完整 ID，或填下方规则名如 @main；建议给 4 个账户设置固定 Label 如 1/2/3/4，新增账号亦不漂移）
+ACCOUNT_ORDER=1,2,3,4
+
+# 可选：多套定制 1/2/3/4 号顺序规则（保存后立即热生效，无需重启）
+#   - 命名预设：main:1>2>3>4, rev:4>3>2>1, pairB:3>4>1>2（可在 ACCOUNT_ORDER=@rev、同名 MODEL_MAPPING 模型别名、或请求头 X-AIStudio-Account-Order: rev 中随时切换）
+#   - 模型专属：model=gemini-4-argon:3>4>1>2, model=gemini-4-*:2>1>3>4
+#   - 密钥专属：key=sk-chat:1>2>3>4, key=sk-batch:4>3>2>1
+# ACCOUNT_ORDER_RULES=main:1>2>3>4,rev:4>3>2>1,model=gemini-4-argon:3>4>1>2
 
 # 常驻预热与最大 Worker 数（默认 Camoufox 为 5 和 10，天然支持挂 2~5 个号；若 Astra 本地已调优按需预热策略，请保留 Astra 本地设置）
 # WARM_WORKER_LIMIT=1
@@ -64,8 +70,11 @@ BUILD_NATIVE_NONSTREAM=false
 1. **拉取本仓库并与 Mac 本地改动对齐**：
    - 本仓库远端：`https://github.com/DariusLYX/AIStudio2API.git`（`main` 分支）。
    - 如果 Mac 本地已有正在运行的目录与 Astra 之前修改过的“多号顺序耗尽/故障切换”代码，请对比 `internal/aistudio/accounts.go` 与 `internal/app/`，将本仓库 `internal/camoufoxnative/` 的全套拟真改造（`worker.go`、`page.go`、`generate.go`、`page_test.go`）与你本地的多号调度无缝合入。
-2. **运行单元测试验证**：
+2. **运行单元测试与编译前端/后端**：
    ```bash
-   go test -v ./internal/camoufoxnative/... ./internal/config/...
+   # 如需在 Web 管理后台显示新增的“定制顺序规则”输入框，先构建前端静态产物（不构建前端亦完全兼容，后端保存设置时会自动保留 .env 中的 ACCOUNT_ORDER_RULES）
+   (cd web && npm run build) && cp -r web/dist internal/webui/dist
+   # 运行后端单元测试
+   go test -v ./internal/camoufoxnative/... ./internal/config/... ./internal/aistudio/...
    ```
    确认全部用例 PASS 后重新编译 `aistudio2api` 并重启服务。

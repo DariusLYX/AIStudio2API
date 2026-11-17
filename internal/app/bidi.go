@@ -12,7 +12,7 @@ import (
 
 // OpenBidi 将实时会话绑定到当前生成服务生命周期
 func (service *trackedService) OpenBidi(ctx context.Context, request aistudio.BidiRequest) (*aistudio.BidiSession, error) {
-	request.Model = service.mappedModel(request.Model)
+	ctx, request.Model = service.resolveRequestedModel(ctx, request.Model)
 	api.SetAccessLogTarget(ctx, request.Model, "")
 	request.Model = service.catalogModelID(ctx, request.Model)
 	requestCtx, cancel, err := service.bidiRequestContext(ctx)
@@ -89,10 +89,10 @@ func (service *trackedService) bidiCandidates(ctx context.Context, model string,
 			return nil, err
 		}
 		warmAvailable := append(append([]string(nil), groups.WarmReady...), groups.WarmAvailable...)
-		candidates := service.preferBidiAccounts(warmAvailable, modelID, modelAccessScope)
-		candidates = append(candidates, service.preferBidiAccounts(groups.StandbyReady, modelID, modelAccessScope)...)
-		candidates = append(candidates, service.preferBidiAccounts(groups.WarmBusy, modelID, modelAccessScope)...)
-		candidates = append(candidates, service.preferBidiAccounts(groups.StandbyBusy, modelID, modelAccessScope)...)
+		candidates := service.preferBidiAccounts(ctx, warmAvailable, modelID, modelAccessScope)
+		candidates = append(candidates, service.preferBidiAccounts(ctx, groups.StandbyReady, modelID, modelAccessScope)...)
+		candidates = append(candidates, service.preferBidiAccounts(ctx, groups.WarmBusy, modelID, modelAccessScope)...)
+		candidates = append(candidates, service.preferBidiAccounts(ctx, groups.StandbyBusy, modelID, modelAccessScope)...)
 		if len(candidates) > 0 {
 			return candidates, nil
 		}
@@ -103,12 +103,12 @@ func (service *trackedService) bidiCandidates(ctx context.Context, model string,
 }
 
 // preferBidiAccounts 在实测资格分组内按账户策略排列候选
-func (service *trackedService) preferBidiAccounts(accountIDs []string, modelID string, modelAccessScope string) []string {
+func (service *trackedService) preferBidiAccounts(ctx context.Context, accountIDs []string, modelID string, modelAccessScope string) []string {
 	scope := modelAccessScope
 	if scope == "" {
 		scope = modelID
 	}
-	candidates := service.pool.OrderCandidates(accountIDs, scope)
+	candidates := service.pool.OrderSelectionCandidates(ctx, aistudio.AccountSelection{ModelID: modelID, ModelAccessScope: scope}, accountIDs)
 	if modelAccessScope == "" {
 		return candidates
 	}
