@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"maps"
 	"math"
+	"math/rand/v2"
 	"net/http"
 	"net/url"
 	"path"
@@ -43,9 +44,8 @@ type bidiClient struct {
 	listener func(map[string]any)
 	// loads 是正在载入官网页面的标签页记下的网络状态，键为标签页的 context
 	loads map[string]*pageLoad
-	// pointerX 与 pointerY 记录当前鼠标指针在视口中的最近坐标，供生成贝塞尔曲线移动轨迹
-	pointerX int
-	pointerY int
+	// pointers 按标签页 context 记录当前鼠标指针在视口中的最近坐标，供生成贝塞尔曲线移动轨迹
+	pointers map[string][2]int
 }
 
 // pageLoad 是一个标签页载入官网页面期间从网络事件记下的状态
@@ -84,22 +84,30 @@ func newBiDiClient(connection *websocket.Conn) *bidiClient {
 		channels:   make(map[string]*bidiChannel),
 		done:       make(chan struct{}),
 		loads:      make(map[string]*pageLoad),
-		pointerX:   460,
-		pointerY:   380,
+		pointers:   make(map[string][2]int),
 	}
 	go client.read()
 	return client
 }
 
-func (client *bidiClient) pointerPosition() (int, int) {
+func (client *bidiClient) pointerPosition(contextID string) (int, int, bool) {
 	client.mu.Lock()
 	defer client.mu.Unlock()
-	return client.pointerX, client.pointerY
+	if pos, ok := client.pointers[contextID]; ok {
+		return pos[0], pos[1], true
+	}
+	return 380 + rand.IntN(240), 290 + rand.IntN(200), false
 }
 
-func (client *bidiClient) setPointerPosition(x, y int) {
+func (client *bidiClient) setPointerPosition(contextID string, x, y int) {
 	client.mu.Lock()
-	client.pointerX, client.pointerY = x, y
+	client.pointers[contextID] = [2]int{x, y}
+	client.mu.Unlock()
+}
+
+func (client *bidiClient) deletePointerPosition(contextID string) {
+	client.mu.Lock()
+	delete(client.pointers, contextID)
 	client.mu.Unlock()
 }
 

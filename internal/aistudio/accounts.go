@@ -399,6 +399,8 @@ type AccountSelection struct {
 	PlaygroundOnly     bool
 	Channel            Channel
 	PreferredChannel   Channel
+	// StickySession 表示本次请求正在续接已有页面对话或多轮内联媒体上下文，fill-first 下允许保持在已就绪的 PreferredAccountID
+	StickySession bool
 	// IgnoreQuotaCooldown 为 true 时套餐限额与每日限额冷却中的账户照常参与选号
 	IgnoreQuotaCooldown bool
 	anyTier             bool
@@ -2844,9 +2846,6 @@ func (p *AccountPool) classifyCandidatesLocked(
 		default:
 			groups.StandbyReady = append(groups.StandbyReady, account.ID)
 		}
-		if p.routingStrategy == "fill-first" {
-			break
-		}
 	}
 	return groups, nil
 }
@@ -2859,7 +2858,7 @@ func (p *AccountPool) tryAcquireLocked(selection AccountSelection, now time.Time
 	waitable := false
 	var earliest time.Time
 	candidates := p.channelCandidatesLocked(indices, selection)
-	if p.routingStrategy != "fill-first" {
+	if selection.PreferredAccountID != "" && (p.routingStrategy != "fill-first" || selection.StickySession) {
 		sort.SliceStable(candidates, func(left, right int) bool {
 			return p.accounts[candidates[left].index].ID == selection.PreferredAccountID && p.accounts[candidates[right].index].ID != selection.PreferredAccountID
 		})
@@ -2872,6 +2871,7 @@ func (p *AccountPool) tryAcquireLocked(selection AccountSelection, now time.Time
 		if selection.ModelID != "" && !p.channelSupportsLocked(account, candidate.channel, selection) {
 			continue
 		}
+		waitable = true
 		if selection.ResourceID == "" && !selection.anyState {
 			if cooldown, active := selectionCooldown(account, ChannelCooldownScope(candidate.channel, selectionAccessScope(selection)), selection, now); active {
 				if earliest.IsZero() || cooldown.Until.Before(earliest) {
@@ -2883,10 +2883,9 @@ func (p *AccountPool) tryAcquireLocked(selection AccountSelection, now time.Time
 		if candidate.channel != selection.PreferredChannel && p.preferredChannelOpenLocked(account, selection, now) {
 			continue
 		}
-		waitable = true
 		if account.exclusive || account.exclusiveWaiters > 0 || account.authRefreshers > 0 || account.active >= p.perAccountConcurrency ||
 			candidate.channel == ChannelAssistant && account.assistantBusy {
-			if p.routingStrategy == "fill-first" {
+			if p.routingStrategy == "fill-first" && selection.Method == "generateContent" {
 				break
 			}
 			continue
@@ -3087,6 +3086,13 @@ func (p *AccountPool) accountRankLocked(accountID string) int {
 		return rank
 	}
 	return math.MaxInt
+}
+
+// RoutingStrategy 返回当前账户选择策略
+func (p *AccountPool) RoutingStrategy() string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.routingStrategy
 }
 
 // SetRoutingStrategy 设置账户轮询或优先填满策略

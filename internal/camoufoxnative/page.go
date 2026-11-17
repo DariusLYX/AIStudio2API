@@ -60,27 +60,21 @@ const proofFunction = `async (page, prompt, digest) => {
 // clipboardWriteFunction 把参数文本写入剪贴板，调用时带用户激活
 const clipboardWriteFunction = `text => navigator.clipboard.writeText(text)`
 
+// controlKey 是 WebDriver 修饰键 Control 的键码
+const controlKey = "\uE009"
+
 // shortcutKeyActions 生成带随机按键停顿的 Ctrl+<key> 可信键盘动作
 func shortcutKeyActions(key string) []map[string]any {
-	control := pasteKeyActions[0]["value"]
 	d1 := 18 + rand.IntN(25)
 	d2 := 20 + rand.IntN(25)
 	d3 := 55 + rand.IntN(45)
 	d4 := 18 + rand.IntN(25)
 	return []map[string]any{
-		{"type": "keyDown", "value": control}, {"type": "pause", "duration": d1},
+		{"type": "keyDown", "value": controlKey}, {"type": "pause", "duration": d1},
 		{"type": "keyDown", "value": key}, {"type": "pause", "duration": d2}, {"type": "pause", "duration": d3},
 		{"type": "keyUp", "value": key}, {"type": "pause", "duration": d4},
-		{"type": "keyUp", "value": control},
+		{"type": "keyUp", "value": controlKey},
 	}
-}
-
-// pasteKeyActions 是在官网输入框按 Ctrl+V 的可信键盘动作：按下 Control 与 V，按住 70 ms 后依次抬起
-var pasteKeyActions = []map[string]any{
-	{"type": "keyDown", "value": "\uE009"}, {"type": "pause", "duration": 25},
-	{"type": "keyDown", "value": "v"}, {"type": "pause", "duration": 25}, {"type": "pause", "duration": 70},
-	{"type": "keyUp", "value": "v"}, {"type": "pause", "duration": 25},
-	{"type": "keyUp", "value": "\uE009"},
 }
 
 // promptValueFunction 返回可见提示框的当前值
@@ -236,22 +230,28 @@ const (
 	rerunButtonSelector = `ms-chat-turn:last-of-type button[aria-label^="Rerun" i]`
 )
 
-// pointerTargetFunction 把 selector 匹配且文字或 aria-label 匹配 pattern 的第一个可见元素滚动到视口内，返回其内部安全区随机坐标 JSON，没有时返回空字符串
+// pointerTargetFunction 把 selector 匹配且文字或 aria-label 匹配 pattern 的第一个可见元素滚动到视口内，返回其与视口可见交集安全区内的随机坐标 JSON，没有或不可见时返回空字符串
 const pointerTargetFunction = `(selector, pattern) => {
   const expression = new RegExp(pattern, 'i');
   const item = [...document.querySelectorAll(selector)].find(node => node.checkVisibility({visibilityProperty: true}) && expression.test((node.innerText || node.getAttribute('aria-label') || '').trim()));
   if (!item) return '';
   item.scrollIntoView({block: 'nearest', inline: 'nearest'});
   const box = item.getBoundingClientRect();
+  const vw = window.innerWidth, vh = window.innerHeight;
+  const left = Math.max(0, box.left), top = Math.max(0, box.top);
+  const right = Math.min(vw, box.right), bottom = Math.min(vh, box.bottom);
+  if (right - left <= 2 || bottom - top <= 2) return '';
   const rx = 0.3 + Math.random() * 0.4;
   const ry = 0.3 + Math.random() * 0.4;
-  return JSON.stringify({x: Math.round(box.left + box.width * rx), y: Math.round(box.top + box.height * ry)});
+  const x = Math.min(vw - 2, Math.max(1, Math.round(left + (right - left) * rx)));
+  const y = Math.min(vh - 2, Math.max(1, Math.round(top + (bottom - top) * ry)));
+  return JSON.stringify({x, y});
 }`
 
 // pointerMoveDuration 是可信指针从别处移到目标元素所用的基准毫秒数
 const pointerMoveDuration = 120
 
-// humanPointerMoves 生成从 (fromX, fromY) 到 (toX, toY) 的多段二次贝塞尔微弧度、慢-快-慢加减速 pointerMove 动作序列
+// humanPointerMoves 生成从 (fromX, fromY) 到 (toX, toY) 的多段二次贝塞尔微弧度、Smoothstep 慢-快-慢加减速 pointerMove 动作序列
 func humanPointerMoves(fromX, fromY, toX, toY, totalDuration int) []map[string]any {
 	dx := float64(toX - fromX)
 	dy := float64(toY - fromY)
@@ -260,6 +260,9 @@ func humanPointerMoves(fromX, fromY, toX, toY, totalDuration int) []map[string]a
 		return []map[string]any{{"type": "pointerMove", "x": toX, "y": toY, "duration": max(0, totalDuration)}}
 	}
 	steps := 5 + rand.IntN(3) // 5~7 段插值
+	if totalDuration < steps*10 {
+		steps = max(1, totalDuration/10)
+	}
 	// 法向随机弧度偏移（距离的 -12% ~ +12%，钳制在 [-42, 42] 像素内）
 	nx, ny := -dy/dist, dx/dist
 	spread := min(42.0, dist*0.12)
@@ -268,13 +271,11 @@ func humanPointerMoves(fromX, fromY, toX, toY, totalDuration int) []map[string]a
 	ctrlX := float64(fromX) + dx*along + nx*offset
 	ctrlY := float64(fromY) + dy*along + ny*offset
 
-	// 两端慢、中间快的时间权重（模拟人类启动加速与接近目标减速对准）
+	// 空间 Smoothstep s=t^2*(3-2t) 已提供自然的慢-快-慢钟形速度分布；时间步长按均匀基准叠加轻量微扰（0.88~1.12），避免双重缓动产生中间段瞬移突刺
 	weights := make([]float64, steps)
 	var weightSum float64
 	for index := 0; index < steps; index++ {
-		mid := float64(steps-1) / 2.0
-		edge := math.Abs(float64(index)-mid) / max(1.0, mid)
-		w := 0.75 + 0.65*edge
+		w := 0.88 + rand.Float64()*0.24
 		weights[index] = w
 		weightSum += w
 	}
@@ -283,7 +284,6 @@ func humanPointerMoves(fromX, fromY, toX, toY, totalDuration int) []map[string]a
 	remaining := totalDuration
 	for step := 1; step <= steps; step++ {
 		t := float64(step) / float64(steps)
-		// Smoothstep 缓入缓出空间采样
 		s := t * t * (3 - 2*t)
 		inv := 1 - s
 		x := int(math.Round(inv*inv*float64(fromX) + 2*inv*s*ctrlX + s*s*float64(toX)))
@@ -320,8 +320,12 @@ func (client *bidiClient) pointer(ctx context.Context, contextID, selector, patt
 	if actualMove > 0 {
 		actualMove = max(80, move-20+rand.IntN(95))
 	}
-	fromX, fromY := client.pointerPosition()
-	actions := humanPointerMoves(fromX, fromY, target.X, target.Y, actualMove)
+	fromX, fromY, initialized := client.pointerPosition(contextID)
+	var actions []map[string]any
+	if !initialized {
+		actions = append(actions, map[string]any{"type": "pointerMove", "x": fromX, "y": fromY, "duration": 0})
+	}
+	actions = append(actions, humanPointerMoves(fromX, fromY, target.X, target.Y, actualMove)...)
 	if click {
 		hold := 45 + rand.IntN(45)
 		actions = append(actions, map[string]any{"type": "pointerDown", "button": 0}, map[string]any{"type": "pause", "duration": hold}, map[string]any{"type": "pointerUp", "button": 0})
@@ -331,13 +335,13 @@ func (client *bidiClient) pointer(ctx context.Context, contextID, selector, patt
 		"actions": []map[string]any{{"type": "pointer", "id": "mouse", "parameters": map[string]any{"pointerType": "mouse"}, "actions": actions}},
 	})
 	if err == nil {
-		client.setPointerPosition(target.X, target.Y)
+		client.setPointerPosition(contextID, target.X, target.Y)
 	}
 	return true, err
 }
 
-// simulateReading 在一轮回答结束后的空闲期，将鼠标从 Run 按钮沿弧线移回最新对话阅读区，并执行轻量滚轮浏览
-func (client *bidiClient) simulateReading(ctx context.Context, contextID string) error {
+// simulateReading 在一轮回答结束后的空闲期，将鼠标从 Run 按钮沿弧线移回最新对话阅读区，并执行轻量滚轮浏览；shouldAbort 返回真时提前让路
+func (client *bidiClient) simulateReading(ctx context.Context, contextID string, shouldAbort func() bool) error {
 	located, err := client.callFunctionString(ctx, contextID, pointerTargetFunction, lastTurnSelector, "")
 	if err != nil || located == "" {
 		return err
@@ -349,20 +353,30 @@ func (client *bidiClient) simulateReading(ctx context.Context, contextID string)
 	if err := json.Unmarshal([]byte(located), &target); err != nil {
 		return err
 	}
-	fromX, fromY := client.pointerPosition()
+	if shouldAbort != nil && shouldAbort() {
+		return nil
+	}
+	fromX, fromY, initialized := client.pointerPosition(contextID)
+	var actions []map[string]any
+	if !initialized {
+		actions = append(actions, map[string]any{"type": "pointerMove", "x": fromX, "y": fromY, "duration": 0})
+	}
 	moveDur := 160 + rand.IntN(140)
-	moves := humanPointerMoves(fromX, fromY, target.X, target.Y, moveDur)
+	actions = append(actions, humanPointerMoves(fromX, fromY, target.X, target.Y, moveDur)...)
 	if _, err := client.command(ctx, "input.performActions", map[string]any{
 		"context": contextID,
-		"actions": []map[string]any{{"type": "pointer", "id": "mouse", "parameters": map[string]any{"pointerType": "mouse"}, "actions": moves}},
+		"actions": []map[string]any{{"type": "pointer", "id": "mouse", "parameters": map[string]any{"pointerType": "mouse"}, "actions": actions}},
 	}); err != nil {
 		return err
 	}
-	client.setPointerPosition(target.X, target.Y)
-	// 70% 概率在阅读区做一次向上轻滚浏览再滚回底部
+	client.setPointerPosition(contextID, target.X, target.Y)
+	if shouldAbort != nil && shouldAbort() {
+		return nil
+	}
+	// 70% 概率在阅读区做一次向上轻滚浏览再滚回底部（回滚略带正向余量，消除上滚下滚精确为 0 的机械对称）
 	if rand.IntN(10) < 7 {
 		deltaUp := -(90 + rand.IntN(150))
-		deltaDown := -deltaUp
+		deltaDown := -deltaUp + 8 + rand.IntN(32)
 		durUp := 110 + rand.IntN(90)
 		pause := 200 + rand.IntN(260)
 		durDown := 110 + rand.IntN(90)

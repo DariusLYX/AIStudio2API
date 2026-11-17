@@ -226,19 +226,8 @@ func (worker *Worker) placeWindow(ctx context.Context) error {
 	return err
 }
 
-// stopRendering 保持当前标签页的前台图层绘制（真人模式下不关闭 renderLayers，防止长流式生成期间出现后台冻结特征）
-func (worker *Worker) stopRendering(_ context.Context) error {
-	return nil
-}
-
-// interactiveFrameRate 是无头 Worker 的软件 vsync 频率，页面全时按此频率刷新，与官网页面在 60 Hz 显示器上相同
+// interactiveFrameRate 是无头 Worker 的软件 vsync 频率，页面全时按此频率保持前台绘制，与官网页面在 60 Hz 显示器上相同
 const interactiveFrameRate = 60
-
-// idleFrameDivisor 保持为 1，使无头 Worker 全时维持 60 Hz 刷新率
-const idleFrameDivisor = 1
-
-// idleRenderingExpression 保持 vsync 分频为 1 并维持选中标签页的前台图层绘制
-var idleRenderingExpression = fmt.Sprintf("Services.prefs.setIntPref('gfx.display.frame-rate-divisor', %d); gBrowser.selectedBrowser.renderLayers = true", idleFrameDivisor)
 
 // idleMinimizeDelay 为无头 Worker 最后一次界面操作后发出 memory-pressure 的空闲时长，与 SpiderMonkey 后端的空闲收缩 GC 相同
 const idleMinimizeDelay = 5 * time.Minute
@@ -329,18 +318,6 @@ func (worker *Worker) lockInput() {
 	worker.inputWaiters.Add(-1)
 }
 
-// lockInputIdle 在没有前台操作等待时取得 inputMu，后台新开对话让界面运行先接收输入
-func (worker *Worker) lockInputIdle() {
-	for {
-		worker.inputMu.Lock()
-		if worker.inputWaiters.Load() == 0 {
-			return
-		}
-		worker.inputMu.Unlock()
-		runtime.Gosched()
-	}
-}
-
 // selectTab 经浏览器界面层选中标签页并记为选中；调用方持有 inputMu
 func (worker *Worker) selectTab(ctx context.Context, contextID string) error {
 	if _, err := worker.chromeEvaluate(ctx, fmt.Sprintf(selectTabExpression, contextID)); err != nil {
@@ -401,7 +378,7 @@ func (worker *Worker) PageCatalog() PageCatalog {
 	return worker.pageCatalog
 }
 
-// Reload 像官网用户一样在当前标签页中按官网冷启动重新载入页面；当前标签页有进行中的请求时改在新标签页中载入并切换过去，原标签页在其中的请求结束后关闭
+// Reload 像官网用户一样在当前标签页中按官网冷启动重新载入页面；若有进行中的请求或已扩出多个标签页，改在新标签页中载入并切换过去，全部旧标签页在空闲或最后一个请求结束后关闭
 func (worker *Worker) Reload(ctx context.Context) error {
 	worker.mu.Lock()
 	if worker.closed {
@@ -415,9 +392,9 @@ func (worker *Worker) Reload(ctx context.Context) error {
 	defer worker.inputMu.Unlock()
 	worker.mu.Lock()
 	contextID := worker.contextID
-	busy := worker.tabs[contextID] != nil
+	needNewTab := len(worker.tabs) > 0 || len(worker.chats) > 1
 	worker.mu.Unlock()
-	if busy {
+	if needNewTab {
 		opened, err := worker.openTab(ctx)
 		if err != nil {
 			return err
@@ -425,10 +402,7 @@ func (worker *Worker) Reload(ctx context.Context) error {
 		contextID = opened
 	}
 	loaded, err := worker.openPage(ctx, options, contextID)
-	if err == nil && options.Headless && !options.liveView {
-		err = worker.stopRendering(ctx)
-	}
-	if err != nil && busy {
+	if err != nil && needNewTab {
 		return errors.Join(err, worker.closeTab(contextID))
 	}
 	if err != nil {
@@ -437,25 +411,37 @@ func (worker *Worker) Reload(ctx context.Context) error {
 	return worker.switchTab(contextID, loaded)
 }
 
-// switchTab 切换到已载入页面的标签页；页面在原标签页中重新载入时不关闭标签页，否则原标签页没有进行中的受保护请求时立即关闭，有时在其中最后一个请求结束后关闭
+// switchTab 切换到已载入页面的标签页并重置 chats 池；旧标签页没有进行中请求时立即关闭，有进行中请求时标记 retired 由最后一个请求结束时关闭
 func (worker *Worker) switchTab(contextID string, loaded loadedPage) error {
 	worker.mu.Lock()
+	oldChats := worker.chats
 	previous := worker.contextID
 	worker.contextID, worker.page, worker.state, worker.pageCatalog = contextID, loaded.page, loaded.state, loaded.catalog
-	worker.chats[0], worker.selected = &chatTab{contextID: contextID, page: loaded.page}, contextID
-	if previous == contextID {
-		worker.mu.Unlock()
-		return nil
+	worker.chats = []*chatTab{{contextID: contextID, page: loaded.page}}
+	worker.selected = contextID
+	seen := map[string]bool{contextID: true}
+	var toClose []string
+	retireOrQueue := func(oldID string) {
+		if oldID == "" || seen[oldID] {
+			return
+		}
+		seen[oldID] = true
+		if use := worker.tabs[oldID]; use != nil {
+			use.retired = true
+		} else {
+			toClose = append(toClose, oldID)
+		}
 	}
-	use := worker.tabs[previous]
-	if use != nil {
-		use.retired = true
+	retireOrQueue(previous)
+	for _, tab := range oldChats {
+		retireOrQueue(tab.contextID)
 	}
 	worker.mu.Unlock()
-	if use == nil {
-		return worker.closeTab(previous)
+	var errs []error
+	for _, oldID := range toClose {
+		errs = append(errs, worker.closeTab(oldID))
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
 // beginRequest 记下当前标签页中开始的一个受保护请求，返回该标签页与其中的 WAA 页面对象
@@ -492,8 +478,9 @@ func (worker *Worker) finishRequest(contextID string) {
 	}
 }
 
-// closeTab 关闭标签页
+// closeTab 关闭标签页并清理其关联指针状态
 func (worker *Worker) closeTab(contextID string) error {
+	worker.client.deletePointerPosition(contextID)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if _, err := worker.client.command(ctx, "browsingContext.close", map[string]any{"context": contextID}); err != nil {

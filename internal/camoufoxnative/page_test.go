@@ -2,6 +2,7 @@ package camoufoxnative
 
 import (
 	"encoding/json"
+	"math"
 	"testing"
 )
 
@@ -104,27 +105,101 @@ func TestGeneratePrompt(t *testing.T) {
 	}
 }
 
-// TestHumanPointerMoves 验证多段二次贝塞尔弧线轨迹与慢-快-慢时间分配
+// TestHumanPointerMoves 验证多段二次贝塞尔弧线轨迹、总时长守恒与自然加减速速度比（无中间段瞬移突刺）
 func TestHumanPointerMoves(t *testing.T) {
-	moves := humanPointerMoves(100, 120, 620, 480, 180)
+	fromX, fromY := 100, 120
+	toX, toY := 620, 480
+	moves := humanPointerMoves(fromX, fromY, toX, toY, 180)
 	if len(moves) < 5 || len(moves) > 7 {
 		t.Fatalf("期望 5~7 段移动轨迹，实际为 %d 段", len(moves))
 	}
 	total := 0
+	prevX, prevY := fromX, fromY
+	minSpeed, maxSpeed := math.MaxFloat64, 0.0
 	for index, move := range moves {
 		dur, ok := move["duration"].(int)
 		if !ok || dur < 10 {
 			t.Fatalf("第 %d 段 duration 无效: %v", index, move["duration"])
 		}
+		x, y := move["x"].(int), move["y"].(int)
+		segDist := math.Hypot(float64(x-prevX), float64(y-prevY))
+		speed := segDist / float64(dur)
+		minSpeed = min(minSpeed, speed)
+		maxSpeed = max(maxSpeed, speed)
+		prevX, prevY = x, y
 		total += dur
 	}
 	if total != 180 {
 		t.Fatalf("轨迹总耗时 = %d, want 180", total)
 	}
+	avgSpeed := math.Hypot(float64(toX-fromX), float64(toY-fromY)) / float64(total)
+	if maxSpeed > avgSpeed*2.8 {
+		t.Fatalf("轨迹出现中间段瞬移突刺: maxSpeed=%.2f, avgSpeed=%.2f, ratio=%.2f", maxSpeed, avgSpeed, maxSpeed/avgSpeed)
+	}
+	_ = minSpeed
 	last := moves[len(moves)-1]
-	if last["x"] != 620 || last["y"] != 480 {
-		t.Fatalf("终点坐标 = (%v, %v), want (620, 480)", last["x"], last["y"])
+	if last["x"] != toX || last["y"] != toY {
+		t.Fatalf("终点坐标 = (%v, %v), want (%d, %d)", last["x"], last["y"], toX, toY)
 	}
 }
 
+// TestNextTabActionModelSwitch 验证同文切换模型时不误判为原地 Rerun，而是新开对话
+func TestNextTabActionModelSwitch(t *testing.T) {
+	turn1User := json.RawMessage(`[[[null,"你好"]],"user"]`)
+	turn1Model := json.RawMessage(`[[[null,"你好！有什么可以帮你？"]],"model"]`)
+	turn2User := json.RawMessage(`[[[null,"继续"]],"user"]`)
 
+	prev := []json.RawMessage{turn1User}
+	// 同模型同内容 -> chatRerun
+	if got := nextTabAction("models/gemini-4-carbon", prev, "models/gemini-4-carbon", prev); got != chatRerun {
+		t.Fatalf("同模型同内容期望 chatRerun，实际为 %v", got)
+	}
+	// 切换模型但同内容 -> chatNew（避免在旧模型对话上点 Rerun 却篡改 XHR 模型）
+	if got := nextTabAction("models/gemini-4-carbon", prev, "models/gemini-4-argon", prev); got != chatNew {
+		t.Fatalf("换模型同内容期望 chatNew，实际为 %v", got)
+	}
+	// 多轮中途切换模型 -> chatNew
+	curr2 := []json.RawMessage{turn1User, turn1Model, turn2User}
+	if got := nextTabAction("models/gemini-4-carbon", prev, "models/gemini-4-argon", curr2); got != chatNew {
+		t.Fatalf("多轮中途换模型期望 chatNew，实际为 %v", got)
+	}
+}
+
+// TestSelectTabInPoolAndFunctionTabDirty 验证多标签页亲和选择优先级（matched > empty > fallback）与 dirty 隔离
+func TestSelectTabInPoolAndFunctionTabDirty(t *testing.T) {
+	turn1User := json.RawMessage(`[[[null,"问题A"]],"user"]`)
+	turn1ModelFn := json.RawMessage(`[[[null,null,null,null,null,null,null,null,null,null,["get_weather",{"city":"SH"}]]],"model"]`)
+	turn2UserFnRes := json.RawMessage(`[[[null,null,null,null,null,null,null,null,null,null,null,["get_weather",{"temp":22}]]],"user"]`)
+	curr := []json.RawMessage{turn1User, turn1ModelFn, turn2UserFnRes}
+
+	dirtyTab := &chatTab{contextID: "tab-dirty", model: "models/gemini-4-carbon", contents: []json.RawMessage{turn1User}, dirty: true}
+	emptyTab := &chatTab{contextID: "tab-empty"}
+	matchedTab := &chatTab{contextID: "tab-matched", model: "models/gemini-4-carbon", contents: []json.RawMessage{turn1User}}
+
+	// 1. 同时存在 dirty、empty、matched 时，优先命中 matched
+	if got := selectTabInPool([]*chatTab{dirtyTab, emptyTab, matchedTab}, "models/gemini-4-carbon", curr); got != matchedTab {
+		t.Fatalf("期望优先选中 matchedTab，实际为 %+v", got)
+	}
+	// 2. 新话题无匹配时，优先选中健康 emptyTab，跳过 dirtyTab
+	newTopic := []json.RawMessage{json.RawMessage(`[[[null,"新话题"]],"user"]`)}
+	if got := selectTabInPool([]*chatTab{dirtyTab, emptyTab}, "models/gemini-4-carbon", newTopic); got != emptyTab {
+		t.Fatalf("新话题期望优先选中 emptyTab，实际为 %+v", got)
+	}
+	// 3. 仅有 dirtyTab 空闲时，作为 fallback 返回供 startTurn 自愈重置
+	if got := selectTabInPool([]*chatTab{dirtyTab}, "models/gemini-4-carbon", newTopic); got != dirtyTab {
+		t.Fatalf("仅剩 dirtyTab 时期望返回 fallback，实际为 %+v", got)
+	}
+
+	// 4. functionTab 必须拒绝 dirty 或跨模型的标签页
+	w := &Worker{chats: []*chatTab{dirtyTab}}
+	if tab := w.functionTab("models/gemini-4-carbon", curr); tab != nil {
+		t.Fatalf("dirty 标签页不应被 functionTab 命中: %+v", tab)
+	}
+	w.chats = []*chatTab{matchedTab}
+	if tab := w.functionTab("models/gemini-4-argon", curr); tab != nil {
+		t.Fatalf("跨模型标签页不应被 functionTab 命中: %+v", tab)
+	}
+	if tab := w.functionTab("models/gemini-4-carbon", curr); tab != matchedTab {
+		t.Fatalf("健康同模型标签页应被 functionTab 命中，实际为 %+v", tab)
+	}
+}

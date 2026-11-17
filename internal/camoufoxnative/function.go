@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	mathrand "math/rand/v2"
+	"time"
 )
 
 const (
@@ -17,10 +19,10 @@ const (
 // FunctionCallMarker 是 GenerateContent 响应流中函数调用 Part 的开头：十个空字段后为带函数名的 functionCall
 var FunctionCallMarker = []byte(`[null,null,null,null,null,null,null,null,null,null,["`)
 
-// functionTab 返回最后一轮是 contents 所回应的函数调用、输入框中没有未发出输入的空闲标签页，即 contents 在其上一轮的对话后追加了 model 与 user 两轮，没有时为 nil；调用方持有 mu
-func (worker *Worker) functionTab(contents []json.RawMessage) *chatTab {
+// functionTab 返回最后一轮是 contents 所回应的函数调用、未标脏且输入框中没有未发出输入的空闲标签页；调用方持有 mu
+func (worker *Worker) functionTab(model string, contents []json.RawMessage) *chatTab {
 	for _, tab := range worker.chats {
-		if !tab.busy && !tab.unsent && tab.contents != nil && nextChatAction(tab.contents, contents) == chatContinue {
+		if !tab.busy && !tab.dirty && !tab.unsent && tab.contents != nil && nextTabAction(tab.model, tab.contents, model, contents) == chatContinue {
 			return tab
 		}
 	}
@@ -33,16 +35,17 @@ func (worker *Worker) ContinuesFunctionCall(body []byte) bool {
 	if err != nil {
 		return false
 	}
+	model := generateModel(body)
 	worker.mu.Lock()
 	defer worker.mu.Unlock()
-	return worker.functionTab(contents) != nil
+	return worker.functionTab(model, contents) != nil
 }
 
 // acquireFunctionChat 取得最后一轮是 contents 所回应的函数调用的空闲标签页并标为忙碌
-func (worker *Worker) acquireFunctionChat(contents []json.RawMessage) (*chatTab, error) {
+func (worker *Worker) acquireFunctionChat(model string, contents []json.RawMessage) (*chatTab, error) {
 	worker.mu.Lock()
 	defer worker.mu.Unlock()
-	tab := worker.functionTab(contents)
+	tab := worker.functionTab(model, contents)
 	if tab == nil {
 		return nil, errors.New("没有最后一轮是本请求回应的函数调用的标签页")
 	}
@@ -56,11 +59,17 @@ func (worker *Worker) submitResult(ctx, input context.Context, tab *chatTab, tur
 	if err := worker.click(input, tab.contextID, functionResultInputSelector, "", "官网函数响应输入框", pointerMoveDuration); err != nil {
 		return err
 	}
+	if err := waitContext(ctx, time.Duration(55+mathrand.IntN(55))*time.Millisecond); err != nil {
+		return err
+	}
 	worker.mu.Lock()
 	tab.unsent = true
 	worker.mu.Unlock()
 	if err := pasteText(input, worker.client, tab.contextID, turn.Result); err != nil {
 		return fmt.Errorf("粘贴函数结果: %w", err)
+	}
+	if err := waitContext(ctx, time.Duration(95+mathrand.IntN(95))*time.Millisecond); err != nil {
+		return err
 	}
 	if err := worker.arm(ctx, tab, turn, requestID); err != nil {
 		return err

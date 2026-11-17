@@ -110,15 +110,23 @@ type chatContinuer interface {
 }
 
 // PageChatAccount 返回当前 Camoufox 页面中正在进行 contents 所属多轮对话的账户 ID，供多账户调度器优先粘性复用同一账户
-func PageChatAccount(contents []Content) string {
+func PageChatAccount(model string, contents []Content) string {
 	if len(contents) == 0 {
+		return ""
+	}
+	hasWorkers := false
+	pageWorkers.Range(func(_, _ any) bool {
+		hasWorkers = true
+		return false
+	})
+	if !hasWorkers {
 		return ""
 	}
 	encoded, err := encodeContents(contents)
 	if err != nil {
 		return ""
 	}
-	body, err := json.Marshal([]any{"models/gemini", encoded})
+	body, err := json.Marshal([]any{wireModelName(model), encoded})
 	if err != nil {
 		return ""
 	}

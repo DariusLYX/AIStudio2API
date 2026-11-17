@@ -66,6 +66,9 @@ type accountWorker struct {
 	busyUntil      time.Time
 	busyDelay      time.Duration
 	busyErr        error
+	startupUntil   time.Time
+	startupDelay   time.Duration
+	startupErr     error
 	// closing 表示持有启动锁的调用方正在释放状态锁关闭 Worker
 	closing bool
 }
@@ -103,6 +106,10 @@ const (
 	runtimeBusyInitialDelay = 5 * time.Second
 	// runtimeBusyMaxDelay 为占用账户重新探测间隔的上限
 	runtimeBusyMaxDelay = time.Minute
+	// startupFailInitialDelay 为冷 Worker 非登录类启动失败后的初始退避时长
+	startupFailInitialDelay = 30 * time.Second
+	// startupFailMaxDelay 为冷 Worker 连续启动失败退避的上限
+	startupFailMaxDelay = 5 * time.Minute
 )
 
 const (
@@ -293,7 +300,24 @@ func (manager *accountWorkerManager) clearRuntimeBusy(account *accountWorker) {
 	}
 }
 
-// runtimeAvailable 过滤仍在占用退避期内的账户，并返回其中一个占用原因
+// markStartupFailed 让非取消、非认证原因启动失败的冷 Worker 按指数退避暂时让出顺位，避免后续每个请求都重复陪跑一次冷启动超时
+func (manager *accountWorkerManager) markStartupFailed(account *accountWorker, cause error, proxy string) error {
+	wrapped := &accountWorkerInitError{err: cause, proxy: proxy}
+	account.mu.Lock()
+	if account.startupDelay == 0 {
+		account.startupDelay = startupFailInitialDelay
+	} else {
+		account.startupDelay = min(account.startupDelay*2, startupFailMaxDelay)
+	}
+	delay := account.startupDelay
+	account.startupUntil = time.Now().Add(delay)
+	account.startupErr = wrapped
+	account.mu.Unlock()
+	time.AfterFunc(delay, manager.notifyScheduling)
+	return wrapped
+}
+
+// runtimeAvailable 过滤仍在占用或冷启动失败退避期内的账户，并返回其中一个退避原因
 func (manager *accountWorkerManager) runtimeAvailable(accountIDs []string) ([]string, error) {
 	now := time.Now()
 	available := make([]string, 0, len(accountIDs))
@@ -308,11 +332,14 @@ func (manager *accountWorkerManager) runtimeAvailable(accountIDs []string) ([]st
 		}
 		account.mu.Lock()
 		busy := now.Before(account.busyUntil)
+		startupCooling := now.Before(account.startupUntil)
 		if busy && busyErr == nil {
 			busyErr = account.busyErr
+		} else if startupCooling && busyErr == nil {
+			busyErr = account.startupErr
 		}
 		account.mu.Unlock()
-		if !busy {
+		if !busy && !startupCooling {
 			available = append(available, accountID)
 		}
 	}
@@ -1137,7 +1164,7 @@ func (manager *accountWorkerManager) startReservedWorker(
 		}
 		manager.requests.logStage(label, "ERROR", api.LogStage{Name: "WAA Worker 启动", State: "failed"}, "WAA Worker 启动失败",
 			"page_model", bootstrapModel, "duration", time.Since(startedAt), "error", initErr)
-		return nil, &accountWorkerInitError{err: initErr, proxy: options.Proxy}
+		return nil, manager.markStartupFailed(account, initErr, options.Proxy)
 	}
 	return &accountWorkerPreparer{
 		account: account, worker: worker, bootstrapModel: bootstrapModel, manager: manager,
@@ -1159,6 +1186,9 @@ func activateAccountWorker(preparer *accountWorkerPreparer) error {
 		return errors.Join(fmt.Errorf("账户不存在: %s", preparer.account.id), discardAccountWorker(preparer))
 	}
 	oldWorker := preparer.account.worker
+	preparer.account.startupDelay = 0
+	preparer.account.startupUntil = time.Time{}
+	preparer.account.startupErr = nil
 	if oldWorker != nil {
 		preparer.account.worker = nil
 		if closeErr := preparer.account.closeUnlocked(oldWorker); closeErr != nil {

@@ -1487,6 +1487,9 @@ func (service *trackedService) acquireWarmLease(ctx context.Context, selection a
 		groups.StandbyReady, readyBusyErr = service.workers.runtimeAvailable(groups.StandbyReady)
 		groups.StandbyBusy, standbyBusyErr = service.workers.runtimeAvailable(groups.StandbyBusy)
 		runtimeBusyErr := errors.Join(readyBusyErr, standbyBusyErr)
+		if service.pool.RoutingStrategy() == "fill-first" {
+			groups = service.restrictFillFirstGroups(groups, selection, active)
+		}
 		candidates := len(groups.WarmReady) + len(groups.WarmAvailable) + len(groups.WarmBusy) +
 			len(groups.StandbyReady) + len(groups.StandbyBusy)
 		standbyReady, opening := service.workers.withoutOpening(groups.StandbyReady)
@@ -1617,6 +1620,40 @@ func (service *trackedService) acquireWarmLease(ctx context.Context, selection a
 		}
 		return nil, service.pool.NoEligibleError(selection)
 	}
+}
+
+// restrictFillFirstGroups 在 fill-first 策略下将已排除启动失败与进程占用的候选账户收敛为顺位第 1 个可用账户；
+// 若 PreferredAccountID 在已活跃的 Worker 中（如原页多轮续聊或持有已上传的内联图片），优先保持在该账户跑完当前对话，新对话则严格回到顺位首号。
+func (service *trackedService) restrictFillFirstGroups(
+	groups aistudio.AccountCandidateGroups,
+	selection aistudio.AccountSelection,
+	activeWarm []string,
+) aistudio.AccountCandidateGroups {
+	surviving := slices.Concat(groups.WarmReady, groups.WarmAvailable, groups.WarmBusy, groups.StandbyReady, groups.StandbyBusy)
+	if len(surviving) <= 1 {
+		return groups
+	}
+	ordered := service.pool.OrderCandidates(surviving, selection.ModelAccessScope)
+	if len(ordered) == 0 {
+		return groups
+	}
+	target := ordered[0]
+	if pref := selection.PreferredAccountID; pref != "" && slices.Contains(surviving, pref) &&
+		(selection.StickySession && slices.Contains(activeWarm, pref) || service.pool.AssistantModel(selection.ModelID)) {
+		target = pref
+	}
+	onlyTarget := func(ids []string) []string {
+		if slices.Contains(ids, target) {
+			return []string{target}
+		}
+		return nil
+	}
+	groups.WarmReady = onlyTarget(groups.WarmReady)
+	groups.WarmAvailable = onlyTarget(groups.WarmAvailable)
+	groups.WarmBusy = onlyTarget(groups.WarmBusy)
+	groups.StandbyReady = onlyTarget(groups.StandbyReady)
+	groups.StandbyBusy = onlyTarget(groups.StandbyBusy)
+	return groups
 }
 
 // promotionFailure 返回冷 Worker 启动失败时请求的错误，登录失效时附上没有可用账户的原因
@@ -1921,13 +1958,15 @@ func (service *trackedService) generateWithRetry(
 	retry.attempted = make(map[string]struct{}, retry.maxAttempts)
 	assistant := service.pool.AssistantModel(modelID)
 	preferredAccountID := ""
+	stickySession := false
 	if assistant {
 		preferredAccountID = service.service.(aistudio.AssistantService).AssistantAccount(requestCtx, request)
+		stickySession = preferredAccountID != ""
 	} else {
-		preferredAccountID = service.pool.InlineMediaAccount(request.Contents)
-		if preferredAccountID == "" {
-			preferredAccountID = aistudio.PageChatAccount(request.Contents)
-		}
+		pageAccountID := aistudio.PageChatAccount(modelID, request.Contents)
+		mediaAccountID := service.pool.InlineMediaAccount(request.Contents)
+		preferredAccountID = cmp.Or(mediaAccountID, pageAccountID)
+		stickySession = pageAccountID != "" || mediaAccountID != "" && len(request.Contents) > 1
 	}
 	hedgeable := !request.Background && !assistant && !service.pool.InteractionAgentModel(modelID) && (service.hedgeAuto || service.hedgeAfter > 0) && slices.Contains(service.hedgeModels, modelID)
 	hedged := false
@@ -1948,7 +1987,8 @@ func (service *trackedService) generateWithRetry(
 		}
 		selection := aistudio.AccountSelection{
 			ModelID: modelID, Method: "generateContent",
-			AccountID: selectionAccountID, ResourceID: selectionResourceID, PreferredAccountID: preferredAccountID,
+			AccountID: selectionAccountID, ResourceID: selectionResourceID,
+			PreferredAccountID: preferredAccountID, StickySession: stickySession,
 		}
 		if resourceID != "" || request.Config.SpeechConfig != nil && request.Config.SpeechConfig.Mode != "" {
 			selection.PlaygroundOnly = true
