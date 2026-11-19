@@ -546,17 +546,21 @@ func (worker *Worker) arm(ctx context.Context, tab *chatTab, turn GenerateTurn, 
 	return nil
 }
 
-// promptFillLimit 是界面运行写入官网输入框的最多字符数，与官网把更长的粘贴转为文本附件的长度相同；页面发出时正文整体换成服务的正文
+// promptFillLimit 是官网输入框粘贴的 UTF-16 码元上限，与 JavaScript String.length 一致；页面发出时正文整体换成服务的正文
 const promptFillLimit = 25000
 
-// promptHead 返回界面运行写入官网输入框的提示词开头，最多 promptFillLimit 个字符
+// promptHead 返回最多 promptFillLimit 个 UTF-16 码元的前缀，不拆开补充平面字符（如 emoji）
 func promptHead(prompt string) string {
 	count := 0
-	for index := range prompt {
-		if count == promptFillLimit {
+	for index, r := range prompt {
+		units := 1
+		if r > 0xFFFF {
+			units = 2
+		}
+		if count+units > promptFillLimit {
 			return prompt[:index]
 		}
-		count++
+		count += units
 	}
 	return prompt
 }
