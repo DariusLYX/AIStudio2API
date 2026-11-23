@@ -66,12 +66,15 @@ func TestCustomAccountOrderRules(t *testing.T) {
 		t.Fatalf("模型通配规则 got=%v, want=%v", got, want)
 	}
 
-	// 4. 客户端以 MODEL_MAPPING 别名 carbon-3412 请求时，别名规则优先于目标模型规则 -> 3,4,1,2
-	aliasCtx := ContextWithModelAlias(context.Background(), "models/carbon-3412(high)")
-	got = pool.OrderSelectionCandidates(aliasCtx, AccountSelection{ModelID: "gemini-4-carbon"}, all)
-	if want := []string{"acc3@gmail.com", "acc4@gmail.com", "acc1@gmail.com", "acc2@gmail.com"}; !slices.Equal(got, want) {
-		t.Fatalf("模型别名规则 got=%v, want=%v", got, want)
+	// 4. 客户端以 MODEL_MAPPING 别名 carbon-3412（含思考后缀或 Claude Code [1m] 后缀）请求时，别名规则优先于目标模型规则 -> 3,4,1,2
+	for _, rawAlias := range []string{"models/carbon-3412(high)", "carbon-3412[1m]", "models/carbon-3412(high)[1m]"} {
+		aliasCtx := ContextWithModelAlias(context.Background(), rawAlias)
+		got = pool.OrderSelectionCandidates(aliasCtx, AccountSelection{ModelID: "gemini-4-carbon"}, all)
+		if want := []string{"acc3@gmail.com", "acc4@gmail.com", "acc1@gmail.com", "acc2@gmail.com"}; !slices.Equal(got, want) {
+			t.Fatalf("模型别名规则(%s) got=%v, want=%v", rawAlias, got, want)
+		}
 	}
+	aliasCtx := ContextWithModelAlias(context.Background(), "models/carbon-3412(high)")
 
 	// 5. key=sk-special 规则优先于模型规则 -> 4,1,3,2
 	keyCtx := ContextWithAPIKey(aliasCtx, "sk-special")

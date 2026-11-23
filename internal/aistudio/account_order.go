@@ -25,13 +25,24 @@ func contextAccountOrder(ctx context.Context) string {
 	return order
 }
 
+// normalizeModelRuleKey 剥离 models/ 前缀、末尾 [1m] 上下文标记与思考括号后缀，供定制顺序规则匹配
+func normalizeModelRuleKey(name string) string {
+	name = strings.TrimPrefix(strings.TrimSpace(name), "models/")
+	if strings.HasSuffix(strings.ToLower(name), "[1m]") {
+		name = strings.TrimSpace(name[:len(name)-len("[1m]")])
+	}
+	if open := strings.LastIndex(name, "("); open > 0 && strings.HasSuffix(name, ")") {
+		name = strings.TrimSpace(name[:open])
+	}
+	if strings.HasSuffix(strings.ToLower(name), "[1m]") {
+		name = strings.TrimSpace(name[:len(name)-len("[1m]")])
+	}
+	return name
+}
+
 // ContextWithModelAlias 将 MODEL_MAPPING 转换前的客户端请求模型名写入上下文，供命名顺序规则按别名匹配
 func ContextWithModelAlias(ctx context.Context, alias string) context.Context {
-	alias = strings.TrimPrefix(strings.TrimSpace(alias), "models/")
-	if open := strings.LastIndex(alias, "("); open > 0 && strings.HasSuffix(alias, ")") {
-		alias = strings.TrimSpace(alias[:open])
-	}
-	return context.WithValue(ctx, modelAliasContextKey{}, alias)
+	return context.WithValue(ctx, modelAliasContextKey{}, normalizeModelRuleKey(alias))
 }
 
 func contextModelAlias(ctx context.Context) string {
@@ -235,8 +246,8 @@ func (p *AccountPool) primaryOrderTokensLocked(selection AccountSelection) []str
 			}
 		}
 	}
-	modelID := strings.TrimPrefix(strings.TrimSpace(selection.ModelID), "models/")
-	alias := strings.TrimPrefix(strings.TrimSpace(selection.ModelAlias), "models/")
+	modelID := normalizeModelRuleKey(selection.ModelID)
+	alias := normalizeModelRuleKey(selection.ModelAlias)
 	if alias != "" {
 		for _, rule := range p.accountOrderRules {
 			if (rule.Kind == appconfig.OrderRuleNamed || rule.Kind == appconfig.OrderRuleModel) && strings.EqualFold(rule.Target, alias) {
@@ -305,7 +316,7 @@ func rankInOrderMap(ranks map[string]int, accountID string) int {
 
 // SelectionOrderSignature 返回本次请求在当前策略下的有效账户范围与顺序签名，供调度队列区分不同顺序规则或指定账户以避免队头阻塞
 func (p *AccountPool) SelectionOrderSignature(ctx context.Context, selection AccountSelection) string {
-	selection = p.scopedSelection(ctx, selection)
+	selection = p.ScopedSelection(ctx, selection)
 	allowed := slices.Clone(selection.AllowedAccountIDs)
 	slices.Sort(allowed)
 	scopePrefix := selection.AccountID + "|" + strings.Join(allowed, ",") + "|"
@@ -332,7 +343,7 @@ func (p *AccountPool) OrderSelectionCandidates(ctx context.Context, selection Ac
 	if len(accountIDs) == 0 {
 		return nil
 	}
-	selection = p.scopedSelection(ctx, selection)
+	selection = p.ScopedSelection(ctx, selection)
 	selection.AccountID = ""
 	selection.ResourceID = ""
 	selection.AllowedAccountIDs = accountIDs

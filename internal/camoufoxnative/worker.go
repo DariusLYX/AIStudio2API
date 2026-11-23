@@ -18,6 +18,8 @@ import (
 	"time"
 
 	"github.com/Mag1cFall/AIStudio2API/internal/proxydial"
+	"github.com/Mag1cFall/AIStudio2API/internal/waa/prooftime"
+	"github.com/Mag1cFall/AIStudio2API/internal/waa/rhythm"
 	"github.com/gofrs/flock"
 	"github.com/gorilla/websocket"
 )
@@ -46,6 +48,8 @@ type Worker struct {
 	connection *websocket.Conn
 	client     *bidiClient
 	contextID  string
+	// rhythm 是账户点击与粘贴的事件节奏
+	rhythm rhythm.Rhythm
 	// page 为页面主世界中保存官方 WAA service 与受保护请求状态的对象
 	page      pageHandle
 	state     State
@@ -61,6 +65,13 @@ type Worker struct {
 	tabs map[string]*tabUse
 	// chats 是可运行界面对话的标签页，第一个是当前页面所在的标签页
 	chats []*chatTab
+	// chatsChanged 在界面对话标签页空出或新开结束时关闭
+	chatsChanged chan struct{}
+	// chatOpening 表示正在后台新开界面对话标签页，chatOpenErr 是最近一次新开失败的原因
+	chatOpening bool
+	chatOpenErr error
+	// reloads 是重新载入切换标签页的次数，用于丢弃切换前开始新开的标签页
+	reloads uint64
 	// selected 是浏览器窗口中选中的标签页
 	selected string
 	// inputMu 串行化页面输入与标签页切换，同一时刻只有一个标签页接收指针与输入
@@ -98,12 +109,16 @@ func Start(ctx context.Context, options Options) (*Worker, error) {
 	if err != nil {
 		return nil, err
 	}
-	cacheDirectory, cacheLock, err := lockAccountCache(options.StorageStatePath)
+	account, err := loadAccountRhythm(options.StorageStatePath)
+	if err != nil {
+		return nil, err
+	}
+	cacheDirectory, cacheLock, pending, err := lockAccountCache(options.StorageStatePath)
 	if err != nil {
 		return nil, err
 	}
 	options.CacheDirectory = cacheDirectory
-	worker := &Worker{cacheLock: cacheLock, options: options, tabs: make(map[string]*tabUse)}
+	worker := &Worker{cacheLock: cacheLock, options: options, tabs: make(map[string]*tabUse), rhythm: account}
 	failed := true
 	defer func() {
 		if failed {
@@ -120,6 +135,11 @@ func Start(ctx context.Context, options Options) (*Worker, error) {
 		}
 		if err := worker.closeBrowser(); err != nil {
 			return nil, err
+		}
+	}
+	if pending {
+		if _, err := cacheLock.TryLockContext(ctx, cacheLockPoll); err != nil {
+			return nil, fmt.Errorf("等待旧 Worker 释放账户浏览器缓存: %w", err)
 		}
 	}
 	if err := worker.bootstrap(ctx, options, state); err != nil {
@@ -198,7 +218,8 @@ func (worker *Worker) launch(ctx context.Context, options Options, fingerprint m
 		return fmt.Errorf("连接 Camoufox BiDi: %w", err)
 	}
 	worker.connection = connection
-	worker.client = newBiDiClient(connection)
+	worker.client = newBiDiClient(connection, process)
+	worker.client.rhythm = worker.rhythm
 	sessionCtx, cancel := context.WithTimeout(ctx, browserStartupTimeout)
 	defer cancel()
 	if _, err := worker.client.command(sessionCtx, "session.new", map[string]any{"capabilities": map[string]any{}}); err != nil {
@@ -318,6 +339,34 @@ func (worker *Worker) lockInput() {
 	worker.inputWaiters.Add(-1)
 }
 
+// lockInputWithin 为前台操作取得 inputMu，ctx 结束或等满 limit 时放弃等待并返回错误，此后取得的 inputMu 立即释放
+func (worker *Worker) lockInputWithin(ctx context.Context, limit time.Duration) error {
+	worker.inputWaiters.Add(1)
+	locked := make(chan struct{})
+	go func() {
+		worker.inputMu.Lock()
+		close(locked)
+	}()
+	timeout := time.NewTimer(limit)
+	defer timeout.Stop()
+	var err error
+	select {
+	case <-locked:
+	case <-ctx.Done():
+		err = ctx.Err()
+	case <-timeout.C:
+		err = context.DeadlineExceeded
+	}
+	worker.inputWaiters.Add(-1)
+	if err != nil {
+		go func() {
+			<-locked
+			worker.inputMu.Unlock()
+		}()
+	}
+	return err
+}
+
 // selectTab 经浏览器界面层选中标签页并记为选中；调用方持有 inputMu
 func (worker *Worker) selectTab(ctx context.Context, contextID string) error {
 	if _, err := worker.chromeEvaluate(ctx, fmt.Sprintf(selectTabExpression, contextID)); err != nil {
@@ -378,7 +427,7 @@ func (worker *Worker) PageCatalog() PageCatalog {
 	return worker.pageCatalog
 }
 
-// Reload 像官网用户一样在当前标签页中按官网冷启动重新载入页面；若有进行中的请求或已扩出多个标签页，改在新标签页中载入并切换过去，全部旧标签页在空闲或最后一个请求结束后关闭
+// Reload 像官网用户一样在当前标签页中按官网冷启动重新载入页面，载入期间界面对话不取用该标签页；若有进行中的请求或已扩出多个标签页，改在新标签页中载入并切换过去，全部旧标签页在空闲或最后一个请求结束后关闭
 func (worker *Worker) Reload(ctx context.Context) error {
 	worker.mu.Lock()
 	if worker.closed {
@@ -393,6 +442,16 @@ func (worker *Worker) Reload(ctx context.Context) error {
 	worker.mu.Lock()
 	contextID := worker.contextID
 	needNewTab := len(worker.tabs) > 0 || len(worker.chats) > 1
+	if !needNewTab && len(worker.chats) > 0 {
+		reloading := worker.chats[0]
+		reloading.busy, reloading.resetting = true, true
+		defer func() {
+			worker.mu.Lock()
+			reloading.busy, reloading.resetting = false, false
+			worker.notifyChats()
+			worker.mu.Unlock()
+		}()
+	}
 	worker.mu.Unlock()
 	if needNewTab {
 		opened, err := worker.openTab(ctx)
@@ -402,6 +461,14 @@ func (worker *Worker) Reload(ctx context.Context) error {
 		contextID = opened
 	}
 	loaded, err := worker.openPage(ctx, options, contextID)
+	if err == nil && !needNewTab {
+		worker.mu.Lock()
+		selected := worker.selected
+		worker.mu.Unlock()
+		if selected != "" && selected != contextID {
+			err = worker.selectTab(ctx, contextID)
+		}
+	}
 	if err != nil && needNewTab {
 		return errors.Join(err, worker.closeTab(contextID))
 	}
@@ -416,11 +483,14 @@ func (worker *Worker) switchTab(contextID string, loaded loadedPage) error {
 	worker.mu.Lock()
 	oldChats := worker.chats
 	previous := worker.contextID
+	worker.reloads++
 	worker.contextID, worker.page, worker.state, worker.pageCatalog = contextID, loaded.page, loaded.state, loaded.catalog
 	worker.chats = []*chatTab{{contextID: contextID, page: loaded.page}}
-	worker.selected = contextID
+	if previous != contextID || worker.selected == "" {
+		worker.selected = contextID
+	}
 	seen := map[string]bool{contextID: true}
-	var toClose []string
+	var closing []string
 	retireOrQueue := func(oldID string) {
 		if oldID == "" || seen[oldID] {
 			return
@@ -428,20 +498,24 @@ func (worker *Worker) switchTab(contextID string, loaded loadedPage) error {
 		seen[oldID] = true
 		if use := worker.tabs[oldID]; use != nil {
 			use.retired = true
-		} else {
-			toClose = append(toClose, oldID)
+			return
 		}
+		if worker.selected == oldID {
+			worker.selected = ""
+		}
+		closing = append(closing, oldID)
 	}
 	retireOrQueue(previous)
 	for _, tab := range oldChats {
 		retireOrQueue(tab.contextID)
 	}
+	worker.notifyChats()
 	worker.mu.Unlock()
-	var errs []error
-	for _, oldID := range toClose {
-		errs = append(errs, worker.closeTab(oldID))
+	var err error
+	for _, id := range closing {
+		err = errors.Join(err, worker.closeTab(id))
 	}
-	return errors.Join(errs...)
+	return err
 }
 
 // beginRequest 记下当前标签页中开始的一个受保护请求，返回该标签页与其中的 WAA 页面对象
@@ -470,6 +544,9 @@ func (worker *Worker) finishRequest(contextID string) {
 		delete(worker.tabs, contextID)
 	}
 	closing := idle && use.retired && !worker.closed
+	if closing && worker.selected == contextID {
+		worker.selected = ""
+	}
 	worker.mu.Unlock()
 	if closing {
 		if err := worker.closeTab(contextID); err != nil {
@@ -504,10 +581,13 @@ func (worker *Worker) ProtocolHeaders(ctx context.Context) (http.Header, error) 
 
 // Proof 在一次页面调用中写入官网 prompt 并为 SHA-256 digest 生成 fresh WAA proof，页面值未同步时最多重试 5 秒
 func (worker *Worker) Proof(ctx context.Context, digest string, prompt string) (string, error) {
+	lockStarted := time.Now()
 	worker.lockInput()
 	defer worker.inputMu.Unlock()
 	worker.mu.Lock()
 	defer worker.mu.Unlock()
+	locked := time.Now()
+	prooftime.Observe(ctx, prooftime.Lock, locked.Sub(lockStarted))
 	if worker.closed {
 		return "", errors.New("Camoufox runtime 已关闭")
 	}
@@ -519,11 +599,19 @@ func (worker *Worker) Proof(ctx context.Context, digest string, prompt string) (
 			return "", fmt.Errorf("生成 fresh WAA proof: %w", err)
 		}
 		if result["type"] != "null" {
-			proof, _ := result["value"].(string)
-			if !strings.HasPrefix(proof, "!") {
+			value, _ := result["value"].(string)
+			var page struct {
+				Proof string `json:"proof"`
+				pageProofTiming
+			}
+			if err := json.Unmarshal([]byte(value), &page); err != nil {
+				return "", fmt.Errorf("解析 fresh WAA proof: %w", err)
+			}
+			if !strings.HasPrefix(page.Proof, "!") {
 				return "", errors.New("fresh WAA proof 前缀无效")
 			}
-			return proof, nil
+			page.observe(ctx, locked)
+			return page.Proof, nil
 		}
 		if time.Now().After(deadline) {
 			return "", errors.New("官网 prompt 状态未同步")
@@ -552,16 +640,68 @@ func (worker *Worker) Close() error {
 		return nil
 	}
 	worker.mu.Lock()
-	if worker.closed {
-		worker.mu.Unlock()
+	closed := worker.closed
+	worker.mu.Unlock()
+	if closed {
 		return nil
 	}
+	if err := worker.shutdown(); err != nil {
+		return err
+	}
+	worker.mu.Lock()
+	worker.closed = true
+	worker.mu.Unlock()
+	return nil
+}
+
+// retiring 是在后台关闭中的 Worker
+var retiring sync.WaitGroup
+
+// Retire 让 Worker 退出服务后立即返回，Close 的离开页面、等待上报、结束 session 与清理都在后台进行；同账户随后启动的 Worker 先启动浏览器，载入页面前等账户缓存释放；之后的 Close 直接返回
+func (worker *Worker) Retire() {
+	if worker == nil {
+		return
+	}
+	worker.mu.Lock()
+	if worker.closed {
+		worker.mu.Unlock()
+		return
+	}
+	worker.closed = true
+	worker.mu.Unlock()
+	directory := worker.options.CacheDirectory
+	if directory != "" {
+		retiringCaches.Store(directory, struct{}{})
+	}
+	retiring.Go(func() {
+		if err := worker.shutdown(); err != nil {
+			slog.Warn("Camoufox Worker 后台关闭失败", "error", err)
+		}
+		retiringCaches.Delete(directory)
+	})
+}
+
+// WaitRetired 等待在后台关闭中的 Worker 全部关闭
+func WaitRetired() {
+	retiring.Wait()
+}
+
+// shutdown 把各标签页导航到空白页，等页面卸载时的上报发出后结束 BiDi session、关闭浏览器并释放账户缓存
+func (worker *Worker) shutdown() error {
+	worker.mu.Lock()
 	client := worker.client
 	connection := worker.connection
 	process := worker.process
-	contexts := make([]string, 0, len(worker.chats))
+	contexts := make([]string, 0, len(worker.chats)+len(worker.tabs))
+	seen := make(map[string]struct{}, len(worker.chats)+len(worker.tabs))
 	for _, tab := range worker.chats {
 		contexts = append(contexts, tab.contextID)
+		seen[tab.contextID] = struct{}{}
+	}
+	for contextID := range worker.tabs {
+		if _, ok := seen[contextID]; !ok {
+			contexts = append(contexts, contextID)
+		}
 	}
 	worker.mu.Unlock()
 	if worker.idle != nil {
@@ -585,13 +725,7 @@ func (worker *Worker) Close() error {
 	if err := process.Close(); err != nil {
 		return err
 	}
-	if err := releaseAccountCache(worker.cacheLock); err != nil {
-		return err
-	}
-	worker.mu.Lock()
-	worker.closed = true
-	worker.mu.Unlock()
-	return nil
+	return releaseAccountCache(worker.cacheLock)
 }
 
 // parallel 同时执行各函数并合并它们的错误
@@ -759,11 +893,11 @@ func (worker *Worker) openPage(ctx context.Context, options Options, contextID s
 		"context": contextID,
 		"url":     target,
 		"wait":    "interactive",
-	}); err != nil && !strings.Contains(err.Error(), "NS_ERROR_ABORT") {
+	}); err != nil && !commandErrorContains(err, "NS_ERROR_ABORT") {
 		if cause := context.Cause(pageCtx); errors.Is(cause, ErrProxyUnreachable) {
 			return loadedPage{}, cause
 		}
-		if strings.Contains(err.Error(), "NS_ERROR_PROXY_") {
+		if commandErrorContains(err, "NS_ERROR_PROXY_") {
 			return loadedPage{}, fmt.Errorf("%w: 导航 AI Studio: %v", ErrProxyUnreachable, err)
 		}
 		return loadedPage{}, fmt.Errorf("导航 AI Studio: %w", err)
