@@ -20,6 +20,7 @@ jobs:
     uses: ./.github/workflows/checks.yml
 
   build-linux:
+    if: false
     needs: checks
     runs-on: ubuntu-24.04
     strategy:
@@ -121,7 +122,7 @@ jobs:
         run: |
           number=0.0.0
           link=""
-          if [[ "$GITHUB_REF_TYPE" == tag ]]; then number="${GITHUB_REF_NAME#v}"; link="-X github.com/Mag1cFall/AIStudio2API/internal/app.version=$GITHUB_REF_NAME"; fi
+          if [[ "$GITHUB_REF_TYPE" == tag ]]; then number="${GITHUB_REF_NAME#v}"; number="${number%%[-+]*}"; link="-X github.com/Mag1cFall/AIStudio2API/internal/app.version=$GITHUB_REF_NAME"; fi
           mkdir -p bin
           CGO_ENABLED=0 go install github.com/wailsapp/wails/v3/cmd/wails3@v3.0.0-beta.29
           jq --arg v "$number" '.fixed.file_version = $v | .info["0000"].ProductVersion = $v' build/windows/info.json > bin/info.json
@@ -201,6 +202,7 @@ jobs:
         run: |
           version="$GITHUB_REF_NAME"
           number="${version#v}"
+          number="${number%%[-+]*}"
           pack() {
             name="aistudio2api-${version}-darwin-$1"
             mkdir -p "dist/$name"
@@ -248,6 +250,7 @@ jobs:
           retention-days: 7
 
   desktop-linux:
+    if: false
     needs: checks
     runs-on: ubuntu-22.04
     steps:
@@ -309,7 +312,7 @@ jobs:
 
   release:
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
-    needs: [checks, build-linux, build-windows, desktop-macos, desktop-linux]
+    needs: [checks, build-windows, desktop-macos]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -326,12 +329,10 @@ jobs:
           RELEASE_TAG: ${{ github.ref_name }}
         shell: bash
         run: |
-          flags=()
-          if [[ "$RELEASE_TAG" == *-* ]]; then flags+=(--prerelease); fi
-          gh release create "$RELEASE_TAG" dist/* --verify-tag --generate-notes --title "$RELEASE_TAG" "${flags[@]}"
+          gh release create "$RELEASE_TAG" dist/* --verify-tag --generate-notes --title "$RELEASE_TAG"
 
   docker:
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    if: false
     needs: build-linux
     strategy:
       matrix:

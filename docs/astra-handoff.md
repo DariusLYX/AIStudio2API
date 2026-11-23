@@ -65,16 +65,37 @@ BUILD_NATIVE_NONSTREAM=false
 
 ---
 
-## 四、 Astra 交接与合并执行步骤
+## 四、 Astra (Mac 端 GPT) 极简升级与部署指南
 
-1. **拉取本仓库并与 Mac 本地改动对齐**：
-   - 本仓库远端：`https://github.com/DariusLYX/AIStudio2API.git`（`main` 分支）。
-   - 如果 Mac 本地已有正在运行的目录与 Astra 之前修改过的“多号顺序耗尽/故障切换”代码，请对比 `internal/aistudio/accounts.go` 与 `internal/app/`，将本仓库 `internal/camoufoxnative/` 的全套拟真改造（`worker.go`、`page.go`、`generate.go`、`page_test.go`）与你本地的多号调度无缝合入。
-2. **运行单元测试与编译前端/后端**：
-   ```bash
-   # 如需在 Web 管理后台显示新增的“定制顺序规则”输入框，先构建前端静态产物（不构建前端亦完全兼容，后端保存设置时会自动保留 .env 中的 ACCOUNT_ORDER_RULES）
-   (cd web && npm run build) && cp -r web/dist internal/webui/dist
-   # 运行后端单元测试
-   go test -v ./internal/camoufoxnative/... ./internal/config/... ./internal/aistudio/...
-   ```
-   确认全部用例 PASS 后重新编译 `aistudio2api` 并重启服务。
+本仓库已打通 **GitHub Actions 云端自动构建 macOS 预编译包（`.github/workflows/build.yml`）** 与 **管理后台自更新源重定向（`internal/app/update.go` 指向 `DariusLYX/AIStudio2API`）**，并提供了一键升级脚本 `scripts/update-mac.sh`。
+
+**请 Mac 端维护的 GPT / Astra 按以下最简方式升级，无需再手动分步跑 `npm build` 和手配 CGO 静态库路径：**
+
+### 方式 1：极速升级（日常首选，Mac 端零编译、3 秒完成）
+- **命令行一键拉取云端预编译包**：
+  ```bash
+  git pull origin main
+  bash ./scripts/update-mac.sh
+  ```
+  - 脚本会自动同步 `origin/main`，并从 `https://github.com/DariusLYX/AIStudio2API/releases/latest` 下载 GitHub Actions `macos-15` 云端编译好的 `aistudio2api-<tag>-darwin-arm64.tar.gz`（已内嵌最新 Vue 前端 `internal/webui/dist` 并静态链接最新 `SpiderMonkey` / `libwebp`），校验 SHA-256 后直接替换本地 `aistudio2api` 可执行文件并清除 macOS Quarantine 属性。
+  - 可通过环境变量指定二进制位置或重启命令，例如：`BIN_PATH=./aistudio2api RESTART_CMD="launchctl kickstart -k gui/$(id -u)/com.darius.aistudio2api" bash ./scripts/update-mac.sh`。
+- **Web 管理后台直接点按钮热更新**：
+  - 只要当前运行的是带版本号的二进制（由上述 Release 包或下方 `update-mac.sh --source` 构建），直接在 Web 管理后台进入「版本」面板点「立即更新」，服务会从 `DariusLYX/AIStudio2API` 下载新包、原地替换并自动重启（不会误拉上游原作者仓库）。
+
+### 方式 2：Mac 本地源码一键编译（当你在 Mac 本地额外修改了 Go/前端代码时使用）
+- 如果你在 Mac 本地有未推送的定制改动需要从源码编译，直接运行：
+  ```bash
+  # 自动拉取最新代码 + 自动按 action.yml 版本缓存 SpiderMonkey/libwebp 静态库 + 打包前端 + 带齐 CGO 参数编译
+  bash ./scripts/update-mac.sh --source
+
+  # 若不想执行 git pull（仅编译你当前工作区的本地改动），加 --no-pull；若前端未改动可加 --skip-web：
+  bash ./scripts/update-mac.sh --source --no-pull --skip-web
+  ```
+  - 脚本会自动解析 `.github/actions/static-libraries/action.yml` 中的 `SPIDERMONKEY`（如 `v158.0.1-aistudio2api.2`）和 `LIBWEBP` 版本并下载缓存至 `~/.cache/aistudio2api-static-libs/`，避免上游新增 C++ 符号（如 `clock.cpp`）时因本地静态库版本落后导致 CGO 链接失败。
+
+### 方式 3：Windows / 主维护端发版命令（供参考）
+当在主仓库完成代码修改或上游合并后，推送带定制后缀的 `v*` 标签（如 `v0.3.14-1`、`v0.3.14-2`，既避免与 `upstream` 原生标签冲突，又支持在线热更新识别）即可触发 GitHub Actions 免费构建 macOS（`arm64`/`amd64`/`universal.app`/`.dmg`）与 Windows 发行包并自动发布到 GitHub Releases：
+```bash
+git tag v0.3.14-1
+git push origin main v0.3.14-1
+```

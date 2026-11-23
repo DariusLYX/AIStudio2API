@@ -31,8 +31,8 @@ import (
 	"github.com/Mag1cFall/AIStudio2API/internal/api"
 )
 
-// releaseAPI 为 GitHub 最新发行版本接口
-const releaseAPI = "https://api.github.com/repos/Mag1cFall/AIStudio2API/releases/latest"
+// releaseAPI 为 GitHub 最新发行版本接口（指向个人定制仓库 DariusLYX/AIStudio2API）
+const releaseAPI = "https://api.github.com/repos/DariusLYX/AIStudio2API/releases/latest"
 
 // releaseCheckInterval 为最新发行版本的缓存时长
 const releaseCheckInterval = time.Hour
@@ -94,7 +94,7 @@ func updateMode(version string) string {
 	if managedBy != "" {
 		return "managed"
 	}
-	if !semver.IsValid(version) || semver.Prerelease(version) != "" || semver.Build(version) != "" {
+	if !semver.IsValid(version) {
 		return "development"
 	}
 	for _, marker := range []string{"/.dockerenv", "/run/.containerenv"} {
@@ -103,6 +103,19 @@ func updateMode(version string) string {
 		}
 	}
 	return platformUpdateMode()
+}
+
+// isNewerRelease 判断远端最新发行版 tag 是否可升级（主版本更高，或同主版本下发布了新的定制构建后缀如 v0.3.14-1）
+func isNewerRelease(latest, current string) bool {
+	if latest == "" || latest == current || !semver.IsValid(latest) || !semver.IsValid(current) {
+		return false
+	}
+	latestBase := strings.TrimSuffix(semver.Canonical(latest), semver.Prerelease(latest))
+	currentBase := strings.TrimSuffix(semver.Canonical(current), semver.Prerelease(current))
+	if cmp := semver.Compare(latestBase, currentBase); cmp != 0 {
+		return cmp > 0
+	}
+	return latest != current
 }
 
 // UpdateStatus 返回当前版本与最新发行版本，refresh 为 true 或缓存过期时重新读取
@@ -149,7 +162,7 @@ func (u *selfUpdater) ApplyUpdate(ctx context.Context) (api.UpdateStatus, error)
 	u.progress = api.UpdateProgress{Stage: "download"}
 	u.mu.Unlock()
 	release, err := u.fetchRelease(ctx)
-	if err == nil && semver.Compare(release.TagName, u.version) <= 0 {
+	if err == nil && !isNewerRelease(release.TagName, u.version) {
 		err = updateConflictError("当前已是最新版本 " + u.version)
 	}
 	if err == nil {
@@ -184,7 +197,7 @@ func (u *selfUpdater) statusLocked() api.UpdateStatus {
 	}
 	if release := u.release; release != nil {
 		status.Latest, status.Notes, status.URL, status.PublishedAt = release.TagName, release.Body, release.HTMLURL, release.PublishedAt
-		status.Available = semver.Compare(release.TagName, u.version) > 0
+		status.Available = isNewerRelease(release.TagName, u.version)
 	}
 	return status
 }
