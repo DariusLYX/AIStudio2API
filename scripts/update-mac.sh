@@ -89,7 +89,7 @@ if [[ "$DO_PULL" -eq 1 ]] && git rev-parse --is-inside-work-tree >/dev/null 2>&1
   fi
 fi
 
-install_from_release() {
+install_from_release() (
   local api_url="https://api.github.com/repos/${REPO_SLUG}/releases/latest"
   if [[ -n "$TARGET_TAG" ]]; then
     api_url="https://api.github.com/repos/${REPO_SLUG}/releases/tags/${TARGET_TAG}"
@@ -129,9 +129,9 @@ for a in data.get("assets", []):
     exit 1
   fi
 
-  local tmp_dir
+  # 退出子 shell 时清理下载目录，随后由主脚本执行可选的重启命令。
   tmp_dir="$(mktemp -d)"
-  trap 'rm -rf "$tmp_dir"' EXIT
+  trap 'rm -rf -- "$tmp_dir"' EXIT
 
   echo "==> 下载 ${asset_name} (${tag})..."
   curl -fL --progress-bar "$download_url" -o "$tmp_dir/$asset_name"
@@ -158,7 +158,7 @@ for a in data.get("assets", []):
   mv -f "$extracted" "$BIN_PATH"
   xattr -d com.apple.quarantine "$BIN_PATH" 2>/dev/null || true
   echo "==> [3/3] 升级完成: $BIN_PATH (版本 ${tag})"
-}
+)
 
 build_from_source() {
   local action_file="$REPO_ROOT/.github/actions/static-libraries/action.yml"
